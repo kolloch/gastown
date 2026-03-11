@@ -312,7 +312,16 @@ func buildWitnessStartCommand(rigPath, rigName, townRoot, sessionName, agentOver
 			// reject startup (nested session detection) when inherited from
 			// tmux server environment. NODE_OPTIONS can contain debugger flags
 			// that crash Claude's Node.js runtime.
-			cmd = "env -u CLAUDECODE NODE_OPTIONS='' " + cmd
+			// NOTE: "exec" is a shell builtin, not a binary. If the TOML
+			// start_command begins with "exec", we must keep exec as the
+			// outermost command so the shell handles it, then use env for
+			// the actual binary. "env ... exec cmd" fails because env tries
+			// to run "exec" as a program (exit 127).
+			if strings.HasPrefix(cmd, "exec ") {
+				cmd = "exec env -u CLAUDECODE NODE_OPTIONS='' " + strings.TrimPrefix(cmd, "exec ")
+			} else {
+				cmd = "env -u CLAUDECODE NODE_OPTIONS='' " + cmd
+			}
 			return cmd, nil
 		}
 	}
