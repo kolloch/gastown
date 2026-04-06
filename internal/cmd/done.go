@@ -1747,9 +1747,10 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 				if closeErr := bd.ForceCloseWithReason("done", attachment.AttachedMolecule); closeErr != nil {
 					if !errors.Is(closeErr, beads.ErrNotFound) {
 						fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s: %v\n", attachment.AttachedMolecule, closeErr)
-						// Don't try to close hookedBeadID - it may still be blocked
-						// The Witness will clean up orphaned state
-						return
+						// Don't try to close hookedBeadID - it may still be blocked.
+						// But DO clear hooks and update agent state (goto doneStateUpdate)
+						// so the polecat isn't stuck in 'working' state (za-o9e).
+						goto doneStateUpdate
 					}
 					// Not found = already burned/deleted by another path, continue
 				}
@@ -1804,8 +1805,8 @@ doneStateUpdate:
 		cleanupStatus := parseCleanupStatus(doneCleanupStatus)
 		if cleanupStatus != polecat.CleanupUnknown {
 			if err := bd.UpdateAgentCleanupStatus(agentBeadID, string(cleanupStatus)); err != nil {
+				// Non-fatal: don't return — done-intent labels still need clearing (za-o9e)
 				fmt.Fprintf(os.Stderr, "Warning: couldn't update agent %s cleanup status: %v\n", agentBeadID, err)
-				return
 			}
 		}
 	}
