@@ -45,6 +45,17 @@ func runCmd(timeout time.Duration, name string, args ...string) (*bytes.Buffer, 
 	return &stdout, nil
 }
 
+// runTmuxCmd runs a tmux command using the per-town socket.
+// Without -L, tmux queries the default socket which has no Gas Town sessions.
+func (f *LiveConvoyFetcher) runTmuxCmd(args ...string) (*bytes.Buffer, error) {
+	fullArgs := []string{}
+	if f.tmuxSocket != "" {
+		fullArgs = append(fullArgs, "-L", f.tmuxSocket)
+	}
+	fullArgs = append(fullArgs, args...)
+	return fetcherRunCmd(f.tmuxCmdTimeout, "tmux", fullArgs...)
+}
+
 var fetcherRunCmd = runCmd
 var fetcherGetSessionEnv = func(sessionName, key string) (string, error) {
 	return tmux.NewTmux().GetEnvironment(sessionName, key)
@@ -151,6 +162,11 @@ type LiveConvoyFetcher struct {
 	heartbeatFreshThreshold time.Duration
 	mayorActiveThreshold    time.Duration
 
+	// tmuxSocket is the per-town tmux socket name (e.g., "dipgt-651c6b").
+	// All tmux commands must use -L with this socket; the default socket
+	// has no Gas Town sessions.
+	tmuxSocket string
+
 	// Circuit breaker for FetchConvoys — prevents process storms when
 	// bd list --type=convoy fails persistently (e.g., schema mismatch).
 	convoyBreaker fetchCircuitBreaker
@@ -190,6 +206,7 @@ func NewLiveConvoyFetcher() (*LiveConvoyFetcher, error) {
 		townRoot:                townRoot,
 		townBeads:               filepath.Join(townRoot, ".beads"),
 		registry:                registry,
+		tmuxSocket:              tmux.GetDefaultSocket(),
 		cmdTimeout:              config.ParseDurationOrDefault(webCfg.CmdTimeout, 15*time.Second),
 		ghCmdTimeout:            config.ParseDurationOrDefault(webCfg.GhCmdTimeout, 10*time.Second),
 		tmuxCmdTimeout:          config.ParseDurationOrDefault(webCfg.TmuxCmdTimeout, 2*time.Second),
@@ -509,7 +526,7 @@ func (f *LiveConvoyFetcher) getSessionActivityForAssignee(assignee string) *time
 
 	// Query tmux for session activity
 	// Format: session_activity returns unix timestamp
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}|#{session_activity}",
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{session_activity}",
 		"-f", fmt.Sprintf("#{==:#{session_name},%s}", sessionName))
 	if err != nil {
 		return nil
@@ -541,7 +558,7 @@ func (f *LiveConvoyFetcher) getSessionActivityForAssignee(assignee string) *time
 func (f *LiveConvoyFetcher) getAllPolecatActivity() *time.Time {
 	// List all tmux sessions matching gt-*-* pattern (polecat sessions)
 	// Format: gt-{rig}-{polecat}
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}|#{session_activity}")
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{session_activity}")
 	if err != nil {
 		return nil
 	}
@@ -801,7 +818,7 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 	assignedIssues := f.getAssignedIssuesMap()
 
 	// Query all tmux sessions with window_activity for more accurate timing
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}|#{window_activity}")
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}|#{window_activity}")
 	if err != nil {
 		// tmux not running or no sessions
 		return nil, nil
@@ -964,7 +981,7 @@ func calculateWorkerWorkStatus(activityAge time.Duration, issueID, workerName st
 
 // getWorkerStatusHint captures the last non-empty line from a worker's pane.
 func (f *LiveConvoyFetcher) getWorkerStatusHint(sessionName string) string {
-	stdout, err := runCmd(f.tmuxCmdTimeout, "tmux", "capture-pane", "-t", sessionName, "-p", "-J")
+	stdout, err := f.runTmuxCmd("capture-pane", "-t", sessionName, "-p", "-J")
 	if err != nil {
 		return ""
 	}
@@ -1424,7 +1441,7 @@ func (f *LiveConvoyFetcher) FetchQueues() ([]QueueRow, error) {
 // FetchSessions returns active tmux sessions with role detection.
 func (f *LiveConvoyFetcher) FetchSessions() ([]SessionRow, error) {
 	// List tmux sessions
-	stdout, err := fetcherRunCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}:#{session_activity}")
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}:#{session_activity}")
 	if err != nil {
 		return nil, nil // tmux not running or no sessions
 	}
@@ -1542,7 +1559,7 @@ func (f *LiveConvoyFetcher) FetchMayor() (*MayorStatus, error) {
 	mayorSessionName := session.MayorSessionName()
 
 	// Check if mayor tmux session exists
-	stdout, err := fetcherRunCmd(f.tmuxCmdTimeout, "tmux", "list-sessions", "-F", "#{session_name}:#{session_activity}")
+	stdout, err := f.runTmuxCmd("list-sessions", "-F", "#{session_name}:#{session_activity}")
 	if err != nil {
 		// tmux not running or no sessions
 		return status, nil
