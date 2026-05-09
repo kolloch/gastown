@@ -378,10 +378,13 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 	// Resolve where this bead lives (handles cross-rig routing).
 	// Without this, cross-rig agent beads (e.g., bd-beads-polecat-obsidian
 	// from gastown) would be looked up in the local rig's database and fail.
-	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
+	// noRoute (see ForAgentBead) skips this for agent beads in the local town.
 	target := b
-	if targetDir != b.getResolvedBeadsDir() {
-		target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+	if !b.noRoute {
+		targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
+		if targetDir != b.getResolvedBeadsDir() {
+			target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+		}
 	}
 
 	// Get current issue to preserve immutable fields (title, role_type, rig)
@@ -423,10 +426,14 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 // when the agent bead routes to a different beads dir via routes.jsonl.
 func (b *Beads) UpdateAgentState(id string, state string) (retErr error) {
 	defer func() { telemetry.RecordAgentStateChange(context.Background(), id, state, nil, retErr) }()
-	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
 	target := b
-	if targetDir != b.getResolvedBeadsDir() {
-		target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+	// Skip prefix routing when noRoute is set (agent-bead operations from rig
+	// context — see ForAgentBead).
+	if !b.noRoute {
+		targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
+		if targetDir != b.getResolvedBeadsDir() {
+			target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+		}
 	}
 	return target.UpdateAgentDescriptionFields(id, AgentFieldUpdates{AgentState: &state})
 }
