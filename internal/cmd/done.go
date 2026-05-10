@@ -1253,9 +1253,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				}
 			}
 
-			// Update agent bead with active_mr reference (for traceability)
+			// Update agent bead with active_mr reference (for traceability).
+			// Agent beads live in HQ regardless of rig prefix — bypass routing
+			// via ForAgentBead() to avoid the "issue not found" warning that
+			// leaves active_mr null after every gt done (hq-e73z).
 			if agentBeadID != "" {
-				if err := bd.UpdateAgentActiveMR(agentBeadID, mrID); err != nil {
+				if err := bd.ForAgentBead().UpdateAgentActiveMR(agentBeadID, mrID); err != nil {
 					style.PrintWarning("could not update agent bead with active_mr: %v", err)
 				}
 			}
