@@ -784,10 +784,18 @@ func (d *Daemon) getAgentBeadState(agentBeadID string) (string, error) {
 }
 
 // getAgentBeadInfo fetches and parses an agent bead by ID.
+//
+// Agent beads (gt:agent-labeled, one per polecat/witness/refinery/dog) live
+// in the town/hq Dolt DB but their IDs carry the rig prefix (e.g. za-zack-
+// polecat-furiosa). Without forcing BEADS_DIR to the town's .beads, prefix
+// routing would send the lookup to the rig's DB and return "issue not found"
+// — which the reaper at daemon.go:2796 interprets as a stale polecat and
+// kills mid-work after 3x threshold (hq-3kri). Pin the lookup to the town
+// .beads so the reaper sees the truth.
 func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 	cmd := exec.Command(d.bdPath, "show", agentBeadID, "--json")
 	cmd.Dir = d.config.TownRoot
-	cmd.Env = bdReadOnlyEnv()
+	cmd.Env = append(bdReadOnlyEnv(), "BEADS_DIR="+filepath.Join(d.config.TownRoot, ".beads"))
 	util.SetDetachedProcessGroup(cmd)
 
 	output, err := cmd.Output()
