@@ -270,6 +270,49 @@ func New(config *Config) (*Daemon, error) {
 	}
 
 	// PATCH-006: Resolve binary paths at startup.
+	//
+	// PATCH-007 (hq-olcb): Augment PATH with common user/local bin
+	// directories before LookPath. The daemon is often launched from a
+	// systemd unit / login shell whose PATH does not include
+	// ~/.local/bin, where pip-installed `bd` and user-installed `gt`
+	// typically live. Without this, both LookPath calls fail at
+	// startup → gtPath / bdPath fall back to literal names → every
+	// subsequent exec.Command(d.gtPath, ...) fails with "executable
+	// file not found in $PATH", which cascaded into stranded convoys
+	// (couldn't query rig beads), failed dog dispatches (wisp_reaper
+	// fell back to inline mode), and likely upstream of hq-we9c
+	// (reaper false-positives, since the polecat-has-work check uses
+	// these binaries). Augmenting the daemon's own PATH propagates to
+	// child processes via bdReadOnlyEnv()'s os.Environ() pass-through.
+	if home := os.Getenv("HOME"); home != "" {
+		extras := []string{
+			filepath.Join(home, ".local/bin"),
+			filepath.Join(home, "bin"),
+			"/usr/local/bin",
+		}
+		current := os.Getenv("PATH")
+		parts := strings.Split(current, string(os.PathListSeparator))
+		seen := make(map[string]struct{}, len(parts)+len(extras))
+		for _, p := range parts {
+			seen[p] = struct{}{}
+		}
+		augmented := parts
+		for _, extra := range extras {
+			if _, ok := seen[extra]; ok {
+				continue
+			}
+			if info, statErr := os.Stat(extra); statErr == nil && info.IsDir() {
+				augmented = append([]string{extra}, augmented...)
+				seen[extra] = struct{}{}
+			}
+		}
+		newPath := strings.Join(augmented, string(os.PathListSeparator))
+		if newPath != current {
+			_ = os.Setenv("PATH", newPath)
+			logger.Printf("PATCH-007: augmented daemon PATH with user bin dirs (was=%q, now=%q)", current, newPath)
+		}
+	}
+
 	gtPath, err := exec.LookPath("gt")
 	if err != nil {
 		gtPath = "gt"
