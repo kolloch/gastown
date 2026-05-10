@@ -299,8 +299,14 @@ func init() {
 }
 
 // getDogManager creates a dog.Manager with the current town root.
+//
+// Use FindFromCwdOrError so we honor GT_TOWN_ROOT/GT_ROOT env vars when
+// invoked from a dog worktree (e.g. ~/gt/deacon/dogs/alpha/<rig>/), where
+// FindFromCwd alone might walk up to a non-town ancestor or stop at a path
+// without mayor/rigs.json — which previously broke `gt dog done` and
+// blocked DOG_DONE delivery (hq-zyvo).
 func getDogManager() (*dog.Manager, error) {
-	townRoot, err := workspace.FindFromCwd()
+	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return nil, fmt.Errorf("finding town root: %w", err)
 	}
