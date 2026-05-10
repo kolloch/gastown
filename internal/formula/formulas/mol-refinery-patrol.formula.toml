@@ -64,8 +64,11 @@ source of truth.
 | build_command | (empty) | Build command (e.g., `go build ./...`). Empty = skip. |
 | target_branch | main | Default target branch for merges |
 | delete_merged_branches | true | Whether to delete source branches after merge |
-| judgment_enabled | false | Enable quality review for merges (true/false) |
+| judgment_enabled | true | Enable quality review for merges (true/false). When true, refinery spawns the reviewer fan-out. |
 | review_depth | standard | Review depth: quick, standard, or deep |
+| review_reviewers | security,performance,correctness,architecture | Comma-separated reviewer roles spawned in parallel. Empty = single inline review. |
+| review_gate | true | If true, BLOCKER findings reject the merge. If false, findings are recorded only. |
+| review_timeout_seconds | 300 | Per-reviewer timeout. Timed-out reviewer = PASS with timeout NIT. |
 | merge_strategy | direct | Merge strategy: 'direct' (ff-only merge+push) or 'pr' (GitHub PR) |
 | require_review | false | Require at least one approving GitHub review before merging (pr mode only) |
 
@@ -107,7 +110,7 @@ When `await-event` outputs `EFFORT: full`, run all steps thoroughly (normal mode
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-refinery-patrol"
-version = 14
+version = 15
 
 [vars]
 [vars.wisp_type]
@@ -159,12 +162,24 @@ description = "Whether to delete source branches after merge"
 default = "true"
 
 [vars.judgment_enabled]
-description = "Enable quality review for merges (true/false)"
-default = "false"
+description = "Enable quality review for merges (true/false). When true, refinery spawns the reviewer fan-out specified in review_reviewers."
+default = "true"
 
 [vars.review_depth]
 description = "Review depth: quick, standard, or deep"
 default = "standard"
+
+[vars.review_reviewers]
+description = "Comma-separated list of reviewer roles to spawn in parallel. Each becomes one subagent. Empty = no fan-out (use single inline review)."
+default = "security,performance,correctness,architecture"
+
+[vars.review_gate]
+description = "If true, BLOCKER findings reject the merge. If false, all findings are recorded but the merge proceeds (measurement-only Phase 1 behavior)."
+default = "true"
+
+[vars.review_timeout_seconds]
+description = "Per-reviewer timeout in seconds. Reviewer that times out is treated as PASS with a NIT noting the timeout."
+default = "300"
 
 [vars.merge_strategy]
 description = "Merge strategy: 'direct' (ff-only merge + push) or 'pr' (create GitHub PR). Default: direct."
@@ -419,14 +434,18 @@ Track results: pass count, fail count, specific failures."""
 
 [[steps]]
 id = "quality-review"
-title = "Quality review merge diff"
+title = "Quality review merge diff (parallel reviewer fan-out + merge gate)"
 needs = ["run-tests"]
 description = """
 **Config: judgment_enabled = {{judgment_enabled}}**
 **Config: review_depth = {{review_depth}}**
+**Config: review_reviewers = {{review_reviewers}}**
+**Config: review_gate = {{review_gate}}**
+**Config: review_timeout_seconds = {{review_timeout_seconds}}**
 
-Review the merge diff for quality issues. This step is measurement-only (Phase 1):
-reviews are recorded but do NOT gate merges.
+Review the merge diff using a parallel reviewer fan-out. Each reviewer is a
+separate subagent focused on one concern. Findings are aggregated and — if
+review_gate is true — BLOCKER findings reject the merge.
 
 **Step 1: Check if quality review is enabled**
 
@@ -439,55 +458,266 @@ handle-failures. Log: "Quality review skipped (judgment_enabled=false)"
 git diff origin/main...temp
 ```
 
-If the diff is empty, skip with: "No diff to review"
+If the diff is empty, skip with: "No diff to review" and proceed to handle-failures.
 
-**Step 3: Review the diff**
+If review_reviewers is empty: fall back to a single inline review (steps 3-INLINE
+through 5 below) — used for very small projects or when subagent dispatch is
+unavailable.
 
-Review the diff yourself using your judgment. Assess:
+**Step 3: Spawn reviewer fan-out (PARALLEL)**
 
-1. **Correctness**: Logic errors, off-by-one, nil/null handling, race conditions
-2. **Security**: Injection, auth bypass, secrets in code, unsafe deserialization
-3. **Clarity**: Naming, structure, comments where non-obvious
-4. **Style**: Consistency with surrounding code, idiomatic patterns
+For each reviewer name in review_reviewers (comma-separated), spawn a subagent
+**in parallel** using the Task tool. All Task calls MUST be issued in a single
+message so they execute concurrently.
 
-Depth is controlled by review_depth:
-- `quick`: Focus on correctness and security only. Skim for obvious issues.
-- `standard`: All four categories. Moderate detail.
-- `deep`: Thorough line-by-line review. Flag even minor style issues.
+Each subagent receives:
+- The full merge diff (`git diff origin/main...temp`)
+- The branch + bead-id under review
+- Its reviewer prompt (see Step 4 — Reviewer Prompts)
+- Instruction to return a structured verdict (see Step 5 — Verdict Format)
 
-**Step 4: Score and recommend**
+Per-reviewer timeout: {{review_timeout_seconds}} seconds. A reviewer that times
+out is treated as VERDICT=PASS with a NIT finding "reviewer timed out".
 
-Assign a score from 0.0 to 1.0:
-- 0.9-1.0: Excellent — no issues or only trivial nits
-- 0.7-0.89: Good — minor issues only
-- 0.45-0.69: Needs work — significant issues found
-- 0.0-0.44: Breach — critical issues (security, correctness)
+The 4 standard reviewers are: **security**, **performance**, **correctness**,
+**architecture**. If review_reviewers names a role not in this set, use the
+generic prompt template (Step 4 — Generic) with the role name as the focus.
 
-Recommendation:
-- `approve`: Score >= 0.45
-- `request_changes`: Score < 0.45
+**Step 4: Reviewer prompts**
 
-**Step 5: Record the result as a wisp**
+Each reviewer subagent receives a focused prompt. Use these templates verbatim
+(substitute {{branch}}, {{bead_id}}, {{review_depth}}, {{diff}} as needed):
 
-Record the quality review result. This is fail-open: if the command fails,
-log the error and continue — never block the merge.
+----- SECURITY -----
+You are a security reviewer for a code merge. Branch: {{branch}}. Bead: {{bead_id}}.
+Review depth: {{review_depth}}.
+
+Examine the diff below for security issues ONLY. Out-of-scope concerns
+(performance, style, architecture) belong to other reviewers — do not flag them.
+
+Look for:
+- Secrets, credentials, tokens, or keys in code, comments, logs, or test fixtures
+- Authentication or authorization bypass; missing authz checks on new endpoints
+- Injection: SQL, command, path traversal, XSS, log injection, template injection
+- Unsafe deserialization (pickle, yaml.load, eval, JSON with prototype pollution)
+- New `unsafe` blocks (Rust) or use of unsafe APIs without justification
+- TLS/crypto misuse: weak algorithms, hardcoded IVs, missing cert verification
+- Race conditions with security implications (TOCTOU, auth check vs use)
+- Untrusted input reaching shell, file system, network without sanitization
+- Information disclosure: stack traces, internal paths, PII in errors/logs
+
+Classify each finding strictly:
+- BLOCKER: merging is wrong (real exploitable vuln or clear policy violation)
+- WARN: merge OK but should be improved soon (defense-in-depth gap, weak default)
+- NIT: minor (style of error message, comment about a hypothetical risk)
+
+DIFF:
+{{diff}}
+
+Respond ONLY with the verdict block (see Verdict Format below). No prose preamble.
+
+----- PERFORMANCE -----
+You are a performance reviewer for a code merge. Branch: {{branch}}. Bead: {{bead_id}}.
+Review depth: {{review_depth}}.
+
+Examine the diff below for performance issues ONLY. Other reviewers handle
+correctness, security, architecture — do not flag those.
+
+Look for:
+- Hot-path allocations (Vec/String/Box in inner loops, repeated clones)
+- Lock contention, lock ordering hazards, holding locks across .await
+- Async correctness: blocking I/O inside async fn, missing .await, sync mutex
+  in async context
+- Algorithmic complexity: O(n²) or worse on inputs that can grow large
+- Memory bloat: large structs by value, accumulation without bounds, leaks
+- Missing batching, caching, or short-circuit evaluation where obvious
+- Network/disk I/O in hot paths, sync I/O on the request path
+- Unbounded channels, queues, or buffers
+- Repeated work that could be memoized or moved out of the loop
+
+Classify strictly: BLOCKER (real perf regression demonstrable) / WARN (likely
+slow but not catastrophic) / NIT (micro-optimization, minor allocation).
+
+DIFF:
+{{diff}}
+
+Respond ONLY with the verdict block (see Verdict Format below). No prose preamble.
+
+----- CORRECTNESS -----
+You are a correctness reviewer for a code merge. Branch: {{branch}}. Bead: {{bead_id}}.
+Review depth: {{review_depth}}.
+
+Examine the diff below for correctness issues ONLY. Other reviewers handle
+security, performance, architecture — do not flag those.
+
+Look for:
+- Logic errors, off-by-one, wrong comparison operators
+- Nil/null/None/Option/Result mishandling, missing unwrap_or, panics on edge inputs
+- Incomplete error handling: swallowed errors, .unwrap() in fallible paths,
+  errors that should be propagated being logged-and-ignored
+- Race conditions, data races, missing synchronization
+- Edge cases: empty inputs, single-element collections, max/min boundaries,
+  Unicode, very long inputs, zero, negative, NaN
+- Resource cleanup: missing Drop, defer, finally; leaks on error paths
+- Test coverage: new code paths without tests; tests that don't actually assert
+  the new behavior
+- Off-by-one in slice/range bounds, integer overflow, wrap-around
+- Concurrent CAS / compare-and-swap patterns that swallow the failure case
+
+Classify strictly: BLOCKER (will produce wrong results or panic on realistic
+input) / WARN (edge case unlikely but real) / NIT (defensive code style only).
+
+DIFF:
+{{diff}}
+
+Respond ONLY with the verdict block (see Verdict Format below). No prose preamble.
+
+----- ARCHITECTURE -----
+You are an architecture reviewer for a code merge. Branch: {{branch}}. Bead: {{bead_id}}.
+Review depth: {{review_depth}}.
+
+Examine the diff below for architecture issues ONLY. Other reviewers handle
+correctness, security, performance — do not flag those.
+
+Look for:
+- Layering violations: lower layer imports higher, or sibling modules cross-talk
+  bypassing intended boundaries
+- API stability: breaking changes to public APIs without deprecation; new public
+  surface that locks in implementation details
+- Doc drift: code changes without corresponding doc updates; stale comments
+- New dependencies: are they justified? Already-vendored alternatives?
+  Maintenance/security history of the new dep
+- Pattern inconsistency: this code uses pattern X, surrounding code uses Y;
+  pick one and document why if needed
+- Abstraction quality: premature abstraction, leaky abstraction, missing
+  abstraction where the same logic is repeated 3+ times
+- Configuration sprawl: new flags/vars without clear ownership
+- Test architecture: tests coupled to internal implementation details
+
+Classify strictly: BLOCKER (locks in a wrong shape that's expensive to undo) /
+WARN (pattern smell, likely refactor needed within a quarter) / NIT (style of
+naming, minor cleanup).
+
+DIFF:
+{{diff}}
+
+Respond ONLY with the verdict block (see Verdict Format below). No prose preamble.
+
+----- GENERIC (for custom reviewer roles) -----
+You are a {{role}} reviewer for a code merge. Branch: {{branch}}. Bead: {{bead_id}}.
+Review depth: {{review_depth}}.
+
+Examine the diff below from a {{role}} perspective. Stay in your lane.
+
+Classify findings strictly: BLOCKER / WARN / NIT.
+
+DIFF:
+{{diff}}
+
+Respond ONLY with the verdict block. No prose preamble.
+
+**Step 5: Verdict format (each reviewer)**
+
+Each reviewer MUST respond with exactly this block (no preamble, no postamble):
+
+```
+VERDICT: <PASS | WARN | BLOCKER>
+SUMMARY: <one-line summary>
+FINDINGS:
+- [BLOCKER] <description> (path:line if known)
+- [WARN] <description> (path:line if known)
+- [NIT] <description> (path:line if known)
+END
+```
+
+If no findings: list "- (none)" under FINDINGS.
+
+The reviewer's overall VERDICT is the worst of its findings: BLOCKER if any
+BLOCKER finding, WARN if any WARN (no BLOCKER), PASS otherwise.
+
+**Step 6: Aggregate verdicts**
+
+Collect all reviewer outputs. For each, parse the VERDICT line and FINDINGS list.
+
+Aggregate counts:
+- total_blockers = sum of [BLOCKER] findings across all reviewers
+- total_warns = sum of [WARN] findings
+- total_nits = sum of [NIT] findings
+- timed_out = list of reviewers that timed out
+
+Lead the merge log with: `review: B=<n> W=<n> N=<n> (reviewers: <list>)`.
+
+**Step 7: Record the aggregate result**
+
+Fail-open: if recording fails, log and continue — never block the merge on a
+recording error.
 
 ```bash
-bd create "quality-review: Score <score>, <recommendation>" -t chore --ephemeral \\
-  -l type:plugin-run,plugin:quality-review-result,worker:<polecat-name>,rig:<rig-name>,score:<score>,recommendation:<approve|request_changes>,result:success \\
-  -d "Score: <score>, <recommendation>. Issues: <count> (<summary>)" \\
+# Per-reviewer record
+for each reviewer:
+  bd create "quality-review: <reviewer>: <VERDICT>" -t chore --ephemeral \\
+    -l type:plugin-run,plugin:quality-review-result,reviewer:<reviewer>,worker:<polecat-name>,rig:<rig-name>,verdict:<VERDICT>,result:success \\
+    -d "<SUMMARY>. Findings: <count>" \\
+    --silent 2>/dev/null || true
+
+# Aggregate record
+bd create "quality-review: aggregate B=<n> W=<n> N=<n>" -t chore --ephemeral \\
+  -l type:plugin-run,plugin:quality-review-aggregate,worker:<polecat-name>,rig:<rig-name>,blockers:<n>,warns:<n>,nits:<n>,result:success \\
+  -d "Reviewers: <list>. Blockers: <n>. Warns: <n>. Nits: <n>." \\
   --silent 2>/dev/null || true
 ```
 
-**Step 6: Handle breach scores (measurement-only)**
+**Step 8: GATE the merge**
 
-If score < 0.45 (breach threshold):
-- Add a note to your merge summary: "Warning: Quality review breach (score: X.XX)"
-- List the critical/major issues found
-- Do NOT block the merge — Phase 1 is measurement-only
-- Proceed to handle-failures normally
+If review_gate is "true" AND total_blockers > 0:
 
-Track: review score, recommendation, issue count, duration."""
+1. **REJECT the merge.** Do NOT proceed to handle-failures' merge path.
+2. Close the merge request bead with status=closed and reason:
+   ```
+   blocked by review: <total_blockers> BLOCKER finding(s) across <reviewer-list>.
+   See per-reviewer beads for details. Fix and resubmit.
+   ```
+3. Send FIX_NEEDED to the polecat with the BLOCKER list (one finding per line):
+   ```bash
+   gt mail send <rig>/polecats/<polecat-name> -s "FIX_NEEDED <polecat-name>: review BLOCKERs" --stdin <<'BODY'
+   Branch: <branch>
+   Issue: <bead-id>
+   Reason: review BLOCKER
+
+   The pre-merge reviewer fan-out flagged BLOCKER findings. Fix each, then
+   resubmit (gt done).
+
+   BLOCKERS:
+   <one-line per BLOCKER finding, with reviewer tag and path:line>
+   BODY
+   ```
+4. Escalate to mayor with severity HIGH:
+   ```bash
+   gt escalate -s HIGH "review-gate: <bead-id> blocked by <n> BLOCKER(s) — held merge, dispatched fix"
+   ```
+5. Skip the rest of patrol for this MR (loop back to next inbox item).
+
+If review_gate is "true" AND total_blockers == 0 AND total_warns > 0:
+
+- File one follow-up bead PER WARN with priority P2 and label gt:review-finding:
+  ```bash
+  bd create "review-warn: <reviewer>: <one-line>" -t task -p 2 \\
+    -l gt:review-finding,reviewer:<reviewer>,source-bead:<bead-id> \\
+    -d "From <reviewer> review of <bead-id> (branch <branch>):
+  <full finding text>
+  Originating MR is being merged; address in follow-up."
+  ```
+- Lead the merge summary with: "review: 0 BLOCKER, <n> WARN filed as follow-ups"
+- Proceed to handle-failures normally (merge will land)
+
+If review_gate is "true" AND all clean (B=0, W=0): proceed silently. NITs are
+logged in the per-reviewer beads but no follow-ups filed.
+
+If review_gate is "false": this is measurement-only Phase 1 mode. Record results
+(Step 7) but proceed to handle-failures regardless of findings. Add a note to
+the merge log: "review-gate disabled — <n> BLOCKER(s) recorded but not enforced".
+
+Track: total_blockers, total_warns, total_nits, per-reviewer verdicts, duration."""
 
 [[steps]]
 id = "handle-failures"
