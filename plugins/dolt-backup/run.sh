@@ -11,8 +11,24 @@ set -euo pipefail
 
 # --- Configuration -----------------------------------------------------------
 
-DOLT_DATA_DIR="${DOLT_DATA_DIR:-$HOME/gt/.dolt-data}"
-BACKUP_DIR="${DOLT_BACKUP_DIR:-$HOME/gt/.dolt-backup}"
+# Honor GT_TOWN_ROOT first (set by daemon when invoking plugins). The
+# earlier hardcoded ~/gt fallback caused "No databases found" for towns
+# rooted elsewhere (hq-huub).
+if [[ -z "${DOLT_DATA_DIR:-}" ]]; then
+  if [[ -n "${GT_TOWN_ROOT:-}" && -d "$GT_TOWN_ROOT/.dolt-data" ]]; then
+    DOLT_DATA_DIR="$GT_TOWN_ROOT/.dolt-data"
+  else
+    DOLT_DATA_DIR="$HOME/gt/.dolt-data"
+  fi
+fi
+if [[ -z "${DOLT_BACKUP_DIR:-}" ]]; then
+  if [[ -n "${GT_TOWN_ROOT:-}" ]]; then
+    DOLT_BACKUP_DIR="$GT_TOWN_ROOT/.dolt-backup"
+  else
+    DOLT_BACKUP_DIR="$HOME/gt/.dolt-backup"
+  fi
+fi
+BACKUP_DIR="$DOLT_BACKUP_DIR"
 BACKUP_TIMEOUT=60
 
 # --- Argument parsing ---------------------------------------------------------
