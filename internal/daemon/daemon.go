@@ -2823,9 +2823,17 @@ func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Durat
 
 	state := hb.EffectiveState()
 
-	// Explicitly idle or exiting — safe to reap
+	// Explicitly idle or exiting — safe to reap (subject to witness consultation).
 	if state == polecat.HeartbeatIdle || state == polecat.HeartbeatExiting {
-		d.killIdlePolecat(rigName, polecatName, sessionName, staleDuration, timeout, string(state))
+		ctx := IdleCheckContext{
+			IdleDuration:   staleDuration,
+			Threshold:      timeout,
+			HeartbeatState: string(state),
+			HeartbeatStamp: hb.Timestamp,
+			AgentRunning:   d.tmux.IsAgentRunning(sessionName),
+			ReapReason:     string(state),
+		}
+		d.maybeReapWithWitness(rigName, polecatName, sessionName, staleDuration, timeout, string(state), ctx)
 		return
 	}
 
@@ -2851,7 +2859,16 @@ func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Durat
 			// infrastructure degradation when the agent process is alive but not
 			// detectable (e.g. long thinking sessions, slow process inspection).
 			if staleDuration >= timeout*3 || !d.tmux.IsAgentRunning(sessionName) && staleDuration >= timeout*2 {
-				d.killIdlePolecat(rigName, polecatName, sessionName, staleDuration, timeout, "working-bead-lookup-failed")
+				ctx := IdleCheckContext{
+					IdleDuration:    staleDuration,
+					Threshold:       timeout,
+					HeartbeatState:  string(state),
+					HeartbeatStamp:  hb.Timestamp,
+					HasAssignedWork: false, // we just confirmed no assigned work above
+					AgentRunning:    d.tmux.IsAgentRunning(sessionName),
+					ReapReason:      "working-bead-lookup-failed",
+				}
+				d.maybeReapWithWitness(rigName, polecatName, sessionName, staleDuration, timeout, "working-bead-lookup-failed", ctx)
 			}
 			return
 		}
@@ -2881,7 +2898,52 @@ func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Durat
 		if d.tmux.IsAgentRunning(sessionName) {
 			return
 		}
-		d.killIdlePolecat(rigName, polecatName, sessionName, staleDuration, timeout, "working-no-hook")
+		ctx := IdleCheckContext{
+			IdleDuration:    staleDuration,
+			Threshold:       timeout,
+			HeartbeatState:  string(state),
+			HeartbeatStamp:  hb.Timestamp,
+			HookBead:        info.HookBead,
+			HookBeadClosed:  info.HookBead != "" && d.isBeadClosed(info.HookBead),
+			HasAssignedWork: false,
+			AgentRunning:    false,
+			ReapReason:      "working-no-hook",
+		}
+		d.maybeReapWithWitness(rigName, polecatName, sessionName, staleDuration, timeout, "working-no-hook", ctx)
+	}
+}
+
+// maybeReapWithWitness consults the rig witness via the IDLE_CHECK protocol
+// (hq-yuje / hq-32ee.A) before killing a candidate-for-reaping polecat. If
+// the witness verdict is REAP (or no witness response within the patience
+// budget), the kill proceeds. ALIVE/RESCUE skip the kill; ESCALATE skips
+// the kill and notifies the mayor.
+func (d *Daemon) maybeReapWithWitness(rigName, polecatName, sessionName string, idleDuration, timeout time.Duration, reason string, ctx IdleCheckContext) {
+	verdict, why := d.consultWitnessBeforeReap(rigName, polecatName, sessionName, ctx)
+	switch verdict {
+	case VerdictReap:
+		d.logger.Printf("idle_check: %s/%s proceeding with reap (witness verdict=REAP, reason=%q, fall-through-or-witness=%q)",
+			rigName, polecatName, reason, why)
+		d.killIdlePolecat(rigName, polecatName, sessionName, idleDuration, timeout, reason)
+	case VerdictAlive:
+		d.logger.Printf("idle_check: %s/%s witness verdict=ALIVE (%s) — skipping reap, will recheck next cycle",
+			rigName, polecatName, why)
+	case VerdictRescue:
+		// sendRescueNudge already fired inside consultWitnessBeforeReap.
+		d.logger.Printf("idle_check: %s/%s witness verdict=RESCUE (%s) — nudge sent, skipping reap",
+			rigName, polecatName, why)
+	case VerdictEscalate:
+		d.logger.Printf("idle_check: %s/%s witness verdict=ESCALATE (%s) — escalating to mayor, skipping reap",
+			rigName, polecatName, why)
+		d.escalateIdleCheckToMayor(rigName, polecatName, why)
+	case VerdictDefer:
+		// No verdict yet; the IDLE_CHECK is in flight or pending. Skip this
+		// cycle; a subsequent reaper pass will pick up the verdict.
+		d.logger.Printf("idle_check: %s/%s deferred (%s)", rigName, polecatName, why)
+	default:
+		d.logger.Printf("idle_check: %s/%s unknown verdict %q (%s) — proceeding with reap as safe fallback",
+			rigName, polecatName, verdict, why)
+		d.killIdlePolecat(rigName, polecatName, sessionName, idleDuration, timeout, reason)
 	}
 }
 

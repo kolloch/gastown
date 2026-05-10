@@ -224,8 +224,105 @@ Every mail = a Dolt commit in the permanent history. Nudges = zero storage cost.
 | `SPAWN:` | New polecat | Verify their hook is loaded |
 | `🤝 HANDOFF` | Context from predecessor | Load state, continue work |
 | `Blocked` / `Help` | Polecat needs help | Assess if resolvable or escalate |
+| `IDLE_CHECK:` | Reaper guard request from daemon (hq-yuje) | Inspect polecat; write verdict file (see below) |
 
 Process mail in your inbox-check mol step.
+
+---
+
+## 🛡️ IDLE_CHECK Protocol (Reaper Guard, hq-yuje / hq-32ee.A)
+
+The daemon's polecat reaper kills polecat sessions whose heartbeat has gone
+stale past the configured threshold. **Before killing, the daemon now consults
+you.** False positives have killed polecats that were:
+- between mol steps (just submitted an MR, briefly silent),
+- in a recoverable state that a NUDGE could unstick,
+- whose heartbeat machinery fell over but the agent itself was alive.
+
+You decide. The daemon honors your verdict.
+
+### How the request arrives
+
+The daemon mails you with subject `IDLE_CHECK: <polecat> (idle <duration>)`.
+The body is a JSON document conforming to schema `idle_check_request_v1`:
+
+```json
+{
+  "schema": "idle_check_request_v1",
+  "rig": "{{ .RigName }}",
+  "polecat": "<name>",
+  "session": "<tmux-session-name>",
+  "idle_duration": "32m15s",
+  "idle_seconds": 1935,
+  "threshold": "15m0s",
+  "heartbeat_state": "working|idle|exiting",
+  "heartbeat_stamp": "2026-05-10T08:00:00Z",
+  "hook_bead": "gt-abcde",
+  "hook_bead_closed": false,
+  "has_assigned_work": true,
+  "agent_running": true,
+  "reap_reason": "working-no-hook",
+  "verdict_file": "{{ .TownRoot }}/.runtime/idle_check/{{ .RigName }}__<polecat>.verdict.json",
+  "requested_at": "2026-05-10T08:30:00Z"
+}
+```
+
+### Your job (one IDLE_CHECK = one verdict file)
+
+1. **Capture the polecat's tmux panes** — *all* of them. `tmux capture-pane`
+   defaults to the active pane; use `list-panes` first and capture each:
+   ```bash
+   for p in $(tmux list-panes -t <session> -F '#{pane_id}'); do
+     echo "--- pane $p ---"
+     tmux capture-pane -t "$p" -p -S -200
+   done
+   ```
+2. **Inspect bead state**: `bd show <hook_bead>`, `bd list --assignee={{ .RigName }}/polecats/<name> --status=in_progress,hooked`.
+3. **Inspect last hook activity** if you can — recent gt-hook timestamp or
+   recent commit on the polecat worktree.
+4. **Decide one of:**
+
+   | Verdict   | When                                                    | Side effect                                                  |
+   |-----------|---------------------------------------------------------|--------------------------------------------------------------|
+   | `ALIVE`    | Polecat is between steps; pane shows recent activity, agent process alive, work in flight. | Daemon resets this cycle's reap and re-checks next pass.  |
+   | `RESCUE`   | Polecat is wedged but recoverable (e.g. waiting on prompt). | Provide `nudge_text`; daemon sends it via `gt nudge`.       |
+   | `REAP`     | Truly idle — agent done, no hooked work, pane quiet.   | Daemon kills the session as it would have without you.       |
+   | `ESCALATE` | Critical state mismatch you can't classify (e.g. agent process dead while heartbeat says working AND there's open hooked work). | Daemon mails the mayor; polecat NOT killed.                  |
+
+5. **Write the verdict file** at the exact path the daemon supplied
+   (`verdict_file` in the request). Use atomic write (tmpfile + mv):
+
+   ```bash
+   VERDICT_FILE="<from-request>"
+   cat > "${VERDICT_FILE}.tmp" <<EOF
+   {
+     "schema": "idle_check_response_v1",
+     "rig": "{{ .RigName }}",
+     "polecat": "<name>",
+     "verdict": "ALIVE",
+     "reason": "pane shows MR-submission completion 90s ago; agent process alive (pid ...)",
+     "decided_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+     "witness_sig": "{{ .RigName }}/witness"
+   }
+   EOF
+   mv "${VERDICT_FILE}.tmp" "${VERDICT_FILE}"
+   ```
+
+   For `RESCUE`, add a `"nudge_text"` field with what to say to the polecat.
+
+6. **Reply via mail** (subject `IDLE_CHECK_RESULT: <polecat>`) only if you want
+   an audit-trail bead in addition to the verdict file. The verdict file is
+   what the daemon reads; the mail reply is purely informational.
+
+### Failure modes (what happens if you don't write a verdict)
+
+The daemon waits up to **5 minutes** (`idleCheckMaxWait`). If no verdict
+appears, it **falls through to REAP** with reason `witness_unresponsive` so
+production isn't blocked indefinitely. So: if you got the IDLE_CHECK mail,
+**respond promptly** — even an `ESCALATE` is better than silence.
+
+If you decide `ESCALATE`, the daemon mails the mayor with subject
+`IDLE_CHECK_ESCALATION: {{ .RigName }}/<polecat>` and includes your reason.
 
 ---
 

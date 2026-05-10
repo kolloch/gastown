@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
@@ -572,5 +573,257 @@ func TestGetStartCommand_ClaudeAgentFallsThrough(t *testing.T) {
 	// path adds beacon injection and model flags.
 	if startCmd == "exec claude --dangerously-skip-permissions" {
 		t.Errorf("getStartCommand returned literal TOML start_command verbatim — beacon injection was skipped: %q", startCmd)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// IDLE_CHECK reaper-guard protocol tests (hq-yuje / hq-32ee.A).
+// ---------------------------------------------------------------------------
+//
+// These exercise consultWitnessBeforeReap. They focus on the verdict-handling
+// state machine rather than the gt mail-out path, by seeding verdict files on
+// disk to simulate witness responses. The mail-out branch is exercised
+// indirectly via the "no verdict, no pending → first call dispatches" test
+// using a stub gtPath that points at /bin/true.
+
+// idleCheckTestDaemon builds a minimal Daemon wired for the IDLE_CHECK tests.
+// It uses /bin/true as gtPath so any mail-out invocation succeeds without
+// actually sending mail. Returns the daemon and the town root.
+func idleCheckTestDaemon(t *testing.T) (*Daemon, string) {
+	t.Helper()
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	d := &Daemon{
+		config: &Config{TownRoot: townRoot},
+		logger: log.New(io.Discard, "", 0),
+		gtPath: "/bin/true", // mail-out becomes a no-op success
+	}
+	return d, townRoot
+}
+
+func writeVerdictFileForTest(t *testing.T, townRoot, rig, polecat string, resp IdleCheckResponse) {
+	t.Helper()
+	path := idleCheckVerdictPath(townRoot, rig, polecat)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir verdict dir: %v", err)
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal verdict: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write verdict: %v", err)
+	}
+}
+
+// TestIdleCheck_NoVerdictDispatchesAndDefers covers the "stuck polecat"
+// scenario: first reaper pass observes no verdict and no pending request, so
+// it mails the witness, writes a pending marker, and returns DEFER. The
+// daemon must NOT proceed with the kill on this pass.
+func TestIdleCheck_NoVerdictDispatchesAndDefers(t *testing.T) {
+	d, townRoot := idleCheckTestDaemon(t)
+
+	verdict, why := d.consultWitnessBeforeReap("myai", "ace", "myai-polecat-ace", IdleCheckContext{
+		IdleDuration:   30 * time.Minute,
+		Threshold:      15 * time.Minute,
+		HeartbeatState: "working",
+		HeartbeatStamp: time.Now().Add(-30 * time.Minute),
+		ReapReason:     "working-no-hook",
+	})
+	if verdict != VerdictDefer {
+		t.Fatalf("first call: expected VerdictDefer, got %q (why=%q)", verdict, why)
+	}
+
+	// Pending marker must exist on disk now.
+	pendingPath := idleCheckPendingPath(townRoot, "myai", "ace")
+	if _, err := os.Stat(pendingPath); err != nil {
+		t.Fatalf("expected pending marker at %s: %v", pendingPath, err)
+	}
+
+	// A second back-to-back call must NOT dispatch again — it should keep
+	// deferring while the pending marker is fresh.
+	verdict2, why2 := d.consultWitnessBeforeReap("myai", "ace", "myai-polecat-ace", IdleCheckContext{
+		IdleDuration: 30 * time.Minute,
+		Threshold:    15 * time.Minute,
+		ReapReason:   "working-no-hook",
+	})
+	if verdict2 != VerdictDefer {
+		t.Fatalf("second call (pending fresh): expected VerdictDefer, got %q (why=%q)", verdict2, why2)
+	}
+}
+
+// TestIdleCheck_StuckPolecatEscalates covers the bead spec's first acceptance
+// criterion: stuck polecat → witness verdict ESCALATE → polecat NOT killed.
+// We seed an ESCALATE verdict file directly to simulate the witness having
+// responded.
+func TestIdleCheck_StuckPolecatEscalates(t *testing.T) {
+	d, townRoot := idleCheckTestDaemon(t)
+
+	writeVerdictFileForTest(t, townRoot, "myai", "stuck", IdleCheckResponse{
+		Schema:     "idle_check_response_v1",
+		Rig:        "myai",
+		Polecat:    "stuck",
+		Verdict:    VerdictEscalate,
+		Reason:     "agent process dead but heartbeat says working AND hook_bead is open",
+		DecidedAt:  time.Now(),
+		WitnessSig: "myai/witness",
+	})
+
+	verdict, why := d.consultWitnessBeforeReap("myai", "stuck", "myai-polecat-stuck", IdleCheckContext{
+		IdleDuration:   90 * time.Minute,
+		Threshold:      15 * time.Minute,
+		HeartbeatState: "working",
+		ReapReason:     "working-no-hook",
+	})
+	if verdict != VerdictEscalate {
+		t.Fatalf("expected VerdictEscalate, got %q (why=%q)", verdict, why)
+	}
+	if !strings.Contains(why, "agent process dead") {
+		t.Errorf("expected reason to surface witness-supplied text, got %q", why)
+	}
+
+	// Verdict file must be consumed (deleted) after read.
+	if _, err := os.Stat(idleCheckVerdictPath(townRoot, "myai", "stuck")); !os.IsNotExist(err) {
+		t.Errorf("verdict file should be consumed after read; stat err=%v", err)
+	}
+}
+
+// TestIdleCheck_TrulyIdleReaps covers the second acceptance criterion: truly
+// idle polecat → witness verdict REAP → daemon proceeds with kill.
+func TestIdleCheck_TrulyIdleReaps(t *testing.T) {
+	d, townRoot := idleCheckTestDaemon(t)
+
+	writeVerdictFileForTest(t, townRoot, "myai", "tidy", IdleCheckResponse{
+		Schema:     "idle_check_response_v1",
+		Rig:        "myai",
+		Polecat:    "tidy",
+		Verdict:    VerdictReap,
+		Reason:     "pane quiet for 45m, no assigned work, agent done",
+		DecidedAt:  time.Now(),
+		WitnessSig: "myai/witness",
+	})
+
+	verdict, why := d.consultWitnessBeforeReap("myai", "tidy", "myai-polecat-tidy", IdleCheckContext{
+		IdleDuration:   45 * time.Minute,
+		Threshold:      15 * time.Minute,
+		HeartbeatState: "idle",
+		ReapReason:     "idle",
+	})
+	if verdict != VerdictReap {
+		t.Fatalf("expected VerdictReap, got %q (why=%q)", verdict, why)
+	}
+	if !strings.Contains(why, "agent done") {
+		t.Errorf("expected witness-supplied reason text, got %q", why)
+	}
+	// Cleanup of pending marker (none here) is a no-op; verdict file consumed.
+	if _, err := os.Stat(idleCheckVerdictPath(townRoot, "myai", "tidy")); !os.IsNotExist(err) {
+		t.Errorf("verdict file should be consumed after read; stat err=%v", err)
+	}
+}
+
+// TestIdleCheck_BetweenStepsIsAlive covers the third acceptance criterion:
+// polecat that just submitted an MR and is briefly silent → witness ALIVE →
+// daemon skips kill, will recheck next cycle.
+func TestIdleCheck_BetweenStepsIsAlive(t *testing.T) {
+	d, townRoot := idleCheckTestDaemon(t)
+
+	writeVerdictFileForTest(t, townRoot, "myai", "midstep", IdleCheckResponse{
+		Schema:     "idle_check_response_v1",
+		Rig:        "myai",
+		Polecat:    "midstep",
+		Verdict:    VerdictAlive,
+		Reason:     "MR submission completed 90s ago, agent transitioning to next mol step",
+		DecidedAt:  time.Now(),
+		WitnessSig: "myai/witness",
+	})
+
+	verdict, why := d.consultWitnessBeforeReap("myai", "midstep", "myai-polecat-midstep", IdleCheckContext{
+		IdleDuration:   18 * time.Minute,
+		Threshold:      15 * time.Minute,
+		HeartbeatState: "working",
+		ReapReason:     "working-no-hook",
+	})
+	if verdict != VerdictAlive {
+		t.Fatalf("expected VerdictAlive, got %q (why=%q)", verdict, why)
+	}
+	if _, err := os.Stat(idleCheckVerdictPath(townRoot, "myai", "midstep")); !os.IsNotExist(err) {
+		t.Errorf("verdict file should be consumed after read; stat err=%v", err)
+	}
+}
+
+// TestIdleCheck_StalePendingFallsThroughToReap covers the witness-unresponsive
+// case: a pending request is on disk but is older than idleCheckMaxWait. The
+// daemon must fall through to REAP (with reason "witness_unresponsive") and
+// clean up the stale pending marker.
+func TestIdleCheck_StalePendingFallsThroughToReap(t *testing.T) {
+	d, townRoot := idleCheckTestDaemon(t)
+
+	// Seed a pending marker dated well past idleCheckMaxWait ago.
+	pending := IdleCheckRequest{
+		Schema:      "idle_check_request_v1",
+		Rig:         "myai",
+		Polecat:     "ghost",
+		Session:     "myai-polecat-ghost",
+		RequestedAt: time.Now().Add(-2 * idleCheckMaxWait),
+	}
+	if err := writeJSONAtomic(idleCheckPendingPath(townRoot, "myai", "ghost"), pending); err != nil {
+		t.Fatalf("seed pending: %v", err)
+	}
+
+	verdict, why := d.consultWitnessBeforeReap("myai", "ghost", "myai-polecat-ghost", IdleCheckContext{
+		IdleDuration: 60 * time.Minute,
+		Threshold:    15 * time.Minute,
+		ReapReason:   "working-no-hook",
+	})
+	if verdict != VerdictReap {
+		t.Fatalf("expected VerdictReap fall-through, got %q (why=%q)", verdict, why)
+	}
+	if !strings.Contains(why, "witness_unresponsive") {
+		t.Errorf("expected fall-through reason 'witness_unresponsive', got %q", why)
+	}
+	// Stale pending marker must be cleaned up.
+	if _, err := os.Stat(idleCheckPendingPath(townRoot, "myai", "ghost")); !os.IsNotExist(err) {
+		t.Errorf("stale pending marker should be cleaned up; stat err=%v", err)
+	}
+}
+
+// TestIdleCheck_VerdictWinsOverPending verifies that when both a verdict file
+// AND a pending marker exist, the verdict takes precedence and both are
+// cleaned up.
+func TestIdleCheck_VerdictWinsOverPending(t *testing.T) {
+	d, townRoot := idleCheckTestDaemon(t)
+
+	// Seed both files.
+	pending := IdleCheckRequest{
+		Schema:      "idle_check_request_v1",
+		Rig:         "myai",
+		Polecat:     "race",
+		RequestedAt: time.Now(), // fresh, would otherwise cause DEFER
+	}
+	if err := writeJSONAtomic(idleCheckPendingPath(townRoot, "myai", "race"), pending); err != nil {
+		t.Fatalf("seed pending: %v", err)
+	}
+	writeVerdictFileForTest(t, townRoot, "myai", "race", IdleCheckResponse{
+		Schema:     "idle_check_response_v1",
+		Rig:        "myai",
+		Polecat:    "race",
+		Verdict:    VerdictReap,
+		Reason:     "concurrent verdict beats pending",
+		DecidedAt:  time.Now(),
+		WitnessSig: "myai/witness",
+	})
+
+	verdict, _ := d.consultWitnessBeforeReap("myai", "race", "myai-polecat-race", IdleCheckContext{
+		IdleDuration: 30 * time.Minute,
+		Threshold:    15 * time.Minute,
+		ReapReason:   "idle",
+	})
+	if verdict != VerdictReap {
+		t.Fatalf("expected verdict to win; got %q", verdict)
+	}
+	if _, err := os.Stat(idleCheckPendingPath(townRoot, "myai", "race")); !os.IsNotExist(err) {
+		t.Errorf("pending marker should be cleaned up alongside verdict; stat err=%v", err)
 	}
 }
