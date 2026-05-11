@@ -2509,47 +2509,79 @@ func (d issueDetails) IsBlocked() bool {
 	return false
 }
 
-// getIssueDetailsBatch fetches details for multiple issues in a single bd show call.
-// Returns a map from issue ID to details. Missing/invalid issues are omitted from the map.
+// getIssueDetailsBatch fetches details for multiple issues, grouping IDs by
+// their resolved rig beads dir so bd show is run with the correct BEADS_DIR
+// per rig. Returns a map from issue ID to details. Missing/invalid issues are
+// omitted from the map.
+//
+// We resolve routing in-process (via beads.ResolveBeadsDirForID) rather than
+// relying on bd to auto-route from town root with stripped BEADS_DIR — the
+// latter doesn't actually consult routes.jsonl in current bd versions, which
+// caused every cross-rig tracked issue to land as trackedStatusUnknown
+// ("cross-rig unreachable") even when the bead existed and was closed.
 func getIssueDetailsBatch(issueIDs []string) map[string]*issueDetails {
 	result := make(map[string]*issueDetails)
 	if len(issueIDs) == 0 {
 		return result
 	}
 
-	// Build args: bd show id1 id2 id3 ... --json
-	args := append([]string{"show"}, issueIDs...)
-	args = append(args, "--json")
-
-	// Run from town root so bd's prefix routing (routes.jsonl) can dispatch
-	// to the correct rig database for cross-rig bead lookups. (GH#2960)
 	townRoot, _ := workspace.FindFromCwdOrError()
-	showCmd := exec.Command("bd", args...)
+
+	// Group issue IDs by the beads dir that bd should consult for each.
+	// If we can't find a town root, fall back to a single ungrouped call
+	// that inherits the caller's BEADS_DIR (matches pre-fix behavior).
+	type group struct {
+		beadsDir string
+		ids      []string
+	}
+	var groups []group
 	if townRoot != "" {
-		showCmd.Dir = townRoot
-		showCmd.Env = stripEnvKey(os.Environ(), "BEADS_DIR")
-	}
-	var stdout bytes.Buffer
-	showCmd.Stdout = &stdout
-
-	if err := showCmd.Run(); err != nil {
-		// Batch failed - fall back to individual lookups for robustness
-		// This handles cases where some IDs are invalid/missing
+		townBeadsDir := filepath.Join(townRoot, ".beads")
+		byDir := make(map[string][]string)
 		for _, id := range issueIDs {
-			if details := getIssueDetails(id); details != nil {
-				result[id] = details
+			dir := beads.ResolveBeadsDirForID(townBeadsDir, id)
+			if dir == "" {
+				dir = townBeadsDir
 			}
+			byDir[dir] = append(byDir[dir], id)
 		}
-		return result
+		for dir, ids := range byDir {
+			groups = append(groups, group{beadsDir: dir, ids: ids})
+		}
+	} else {
+		groups = append(groups, group{beadsDir: "", ids: issueIDs})
 	}
 
-	var issues []issueDetailsJSON
-	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil {
-		return result
-	}
+	for _, g := range groups {
+		args := append([]string{"show"}, g.ids...)
+		args = append(args, "--json")
+		showCmd := exec.Command("bd", args...)
+		if g.beadsDir != "" {
+			showCmd.Env = append(stripEnvKey(os.Environ(), "BEADS_DIR"), "BEADS_DIR="+g.beadsDir)
+			// Run from rig dir for any tooling that derives context from cwd.
+			showCmd.Dir = filepath.Dir(g.beadsDir)
+		}
+		var stdout bytes.Buffer
+		showCmd.Stdout = &stdout
 
-	for _, issue := range issues {
-		result[issue.ID] = issue.toIssueDetails()
+		if err := showCmd.Run(); err != nil {
+			// Group failed — fall back to per-ID lookups (handles invalid IDs
+			// without poisoning the whole group).
+			for _, id := range g.ids {
+				if details := getIssueDetails(id); details != nil {
+					result[id] = details
+				}
+			}
+			continue
+		}
+
+		var issues []issueDetailsJSON
+		if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil {
+			continue
+		}
+		for _, issue := range issues {
+			result[issue.ID] = issue.toIssueDetails()
+		}
 	}
 
 	return result
@@ -2557,16 +2589,22 @@ func getIssueDetailsBatch(issueIDs []string) map[string]*issueDetails {
 
 // getIssueDetails fetches issue details by trying to show it via bd.
 // Prefer getIssueDetailsBatch for multiple issues to avoid N+1 subprocess calls.
+//
+// Routing: we resolve the bead ID's prefix to a rig beads dir via
+// beads.ResolveBeadsDirForID and set BEADS_DIR explicitly, since bd's
+// auto-routing from town root with stripped BEADS_DIR is unreliable in
+// current bd versions. (GH#2960 fix v2)
 func getIssueDetails(issueID string) *issueDetails {
-	// Use bd show with routing - resolve from town root so bd's prefix
-	// routing (routes.jsonl) can dispatch to the correct rig database.
-	// Without Dir + StripBeadsDir, bd inherits CWD/BEADS_DIR which may
-	// point to a rig that doesn't contain the target bead. (GH#2960)
 	townRoot, _ := workspace.FindFromCwdOrError()
 	showCmd := exec.Command("bd", "show", issueID, "--json")
 	if townRoot != "" {
-		showCmd.Dir = townRoot
-		showCmd.Env = stripEnvKey(os.Environ(), "BEADS_DIR")
+		townBeadsDir := filepath.Join(townRoot, ".beads")
+		dir := beads.ResolveBeadsDirForID(townBeadsDir, issueID)
+		if dir == "" {
+			dir = townBeadsDir
+		}
+		showCmd.Env = append(stripEnvKey(os.Environ(), "BEADS_DIR"), "BEADS_DIR="+dir)
+		showCmd.Dir = filepath.Dir(dir)
 	}
 	var stdout bytes.Buffer
 	showCmd.Stdout = &stdout
