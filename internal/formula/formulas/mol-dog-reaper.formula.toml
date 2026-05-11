@@ -61,7 +61,7 @@ Discover databases and count candidates for each operation.
 
 **1. List databases to scan:**
 ```bash
-gt reaper databases --port={{dolt_port}} --json
+gt reaper databases --port={{dolt_port}} --json | jq -c .
 ```
 Or use configured database list from {{databases}} variable.
 
@@ -70,8 +70,13 @@ Or use configured database list from {{databases}} variable.
 gt reaper scan --db=<name> --port={{dolt_port}} \\
   --max-age={{max_age}} --purge-age={{purge_age}} \\
   --mail-age={{mail_delete_age}} --stale-age={{stale_issue_age}} \\
-  --json
+  --json | jq -c .
 ```
+
+> **Note:** All `gt reaper --json` invocations in this formula pipe through
+> `jq -c` to emit single-line compact JSON. This keeps tool-output token
+> volume small enough that smaller models (Haiku) don't idle-timeout while
+> synthesizing DOG_DONE. Fixes hq-6hp7 / hq-wisp-eguo (2026-05-11).
 
 **3. Inspect results for anomalies:**
 - Check the `anomalies` array in the JSON output
@@ -95,7 +100,7 @@ Close wisps past max_age whose parent molecule is closed or missing.
 **1. For each database with reap candidates:**
 ```bash
 gt reaper reap --db=<name> --port={{dolt_port}} \\
-  --max-age={{max_age}} {{#if dry_run}}--dry-run{{/if}} --json
+  --max-age={{max_age}} {{#if dry_run}}--dry-run{{/if}} --json | jq -c .
 ```
 
 **2. Inspect results:**
@@ -122,7 +127,7 @@ Delete closed wisps past purge_age and closed mail past mail_delete_age.
 ```bash
 gt reaper purge --db=<name> --port={{dolt_port}} \\
   --purge-age={{purge_age}} --mail-age={{mail_delete_age}} \\
-  {{#if dry_run}}--dry-run{{/if}} --json
+  {{#if dry_run}}--dry-run{{/if}} --json | jq -c .
 ```
 
 **2. Inspect results for anomalies:**
@@ -146,7 +151,7 @@ Close issues that have been open with no status change past stale_issue_age.
 ```bash
 gt reaper auto-close --db=<name> --port={{dolt_port}} \\
   --stale-age={{stale_issue_age}} \\
-  {{#if dry_run}}--dry-run{{/if}} --json
+  {{#if dry_run}}--dry-run{{/if}} --json | jq -c .
 ```
 
 **2. Inspect results:**
