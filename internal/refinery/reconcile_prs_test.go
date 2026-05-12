@@ -129,7 +129,7 @@ func TestReconcileMergedPRs_ClosesOpenBead(t *testing.T) {
 	}}
 
 	var buf bytes.Buffer
-	res, err := reconcileMergedPRsWith(context.Background(), lister, fb, "main", time.Time{}, 10, &buf, t.TempDir(), "zack")
+	res, err := reconcileMergedPRsWith(context.Background(), lister, fb, "main", time.Time{}, 10, &buf, t.TempDir(), "zack", nil)
 	if err != nil {
 		t.Fatalf("reconcile returned error: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestReconcileMergedPRs_SkipsAlreadyClosed(t *testing.T) {
 		"gt-zzzzz": {ID: "gt-zzzzz", Status: string(beads.StatusClosed)},
 	}}
 
-	res, err := reconcileMergedPRsWith(context.Background(), lister, fb, "main", time.Time{}, 10, nil, t.TempDir(), "gastown")
+	res, err := reconcileMergedPRsWith(context.Background(), lister, fb, "main", time.Time{}, 10, nil, t.TempDir(), "gastown", nil)
 	if err != nil {
 		t.Fatalf("reconcile returned error: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestReconcileMergedPRs_CloseFailureSurfaces(t *testing.T) {
 		closeErrs: map[string]error{"gt-broke": errors.New("dolt unreachable")},
 	}
 
-	res, err := reconcileMergedPRsWith(context.Background(), lister, fb, "main", time.Time{}, 10, nil, t.TempDir(), "gastown")
+	res, err := reconcileMergedPRsWith(context.Background(), lister, fb, "main", time.Time{}, 10, nil, t.TempDir(), "gastown", nil)
 	if err != nil {
 		t.Fatalf("reconcile returned error: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestReconcileMergedPRs_NoBeadIDsInPR(t *testing.T) {
 	}}}
 	fb := &fakeBeads{}
 
-	res, err := reconcileMergedPRsWith(context.Background(), lister, fb, "main", time.Time{}, 10, nil, t.TempDir(), "gastown")
+	res, err := reconcileMergedPRsWith(context.Background(), lister, fb, "main", time.Time{}, 10, nil, t.TempDir(), "gastown", nil)
 	if err != nil {
 		t.Fatalf("reconcile returned error: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestReconcileMergedPRs_ShowErrorIsSwallowed(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	res, err := reconcileMergedPRsWith(context.Background(), lister, fb, "main", time.Time{}, 10, &buf, t.TempDir(), "gastown")
+	res, err := reconcileMergedPRsWith(context.Background(), lister, fb, "main", time.Time{}, 10, &buf, t.TempDir(), "gastown", nil)
 	if err != nil {
 		t.Fatalf("reconcile returned error: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestReconcileMergedPRs_ShowErrorIsSwallowed(t *testing.T) {
 func TestReconcileMergedPRs_ListErrorPropagates(t *testing.T) {
 	lister := &fakeLister{err: errors.New("gh down")}
 	fb := &fakeBeads{}
-	_, err := reconcileMergedPRsWith(context.Background(), lister, fb, "main", time.Time{}, 10, nil, t.TempDir(), "gastown")
+	_, err := reconcileMergedPRsWith(context.Background(), lister, fb, "main", time.Time{}, 10, nil, t.TempDir(), "gastown", nil)
 	if err == nil {
 		t.Fatal("expected error when lister fails, got nil")
 	}

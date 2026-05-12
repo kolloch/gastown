@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"path/filepath"
+
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -60,7 +62,11 @@ import (
 //   - "PR-44" (uppercase prefix)
 //   - "v1-x" (id too short)
 //   - "some-thing-here" (hyphen inside a slug, not a bead id)
-var beadIDPattern = regexp.MustCompile(`\b([a-z]{1,6}-[a-z0-9]{3,})\b`)
+// Suffix allows internal hyphens + dots (for sub-beads like 'za-f56.1') so
+// the regex captures the full id 'hq-wisp-x5r4' rather than truncating to
+// 'hq-wisp'. The trailing character must be alnum to avoid grabbing stray
+// dashes/dots from prose.
+var beadIDPattern = regexp.MustCompile(`\b([a-z]{1,6}-[a-z0-9][a-z0-9.-]+[a-z0-9])\b`)
 
 // PRListEntry is one row of `gh pr list ... --json ...` output.
 type PRListEntry struct {
@@ -196,9 +202,37 @@ type ReconcileFailure struct {
 // generous limit (e.g. 50) and a recent `since` (e.g. last 24h) for a
 // patrol-cycle sweep.
 func (m *Manager) ReconcileMergedPRs(ctx context.Context, since time.Time, limit int) (*ReconcileResult, error) {
-	lister := &ghPRLister{workDir: m.workDir}
+	// gh pr list needs to run inside a checkout of the rig's GitHub repo to
+	// resolve the default --repo. The rig's Path (under town root) is NOT a
+	// git checkout — use LocalRepo when available, fall back to Path otherwise.
+	ghDir := m.workDir
+	if m.rig.LocalRepo != "" {
+		ghDir = m.rig.LocalRepo
+	}
+	lister := &ghPRLister{workDir: ghDir}
 	b := beads.New(m.rig.BeadsPath())
-	return reconcileMergedPRsWith(ctx, lister, b, m.rig.DefaultBranch(), since, limit, m.output, m.workDir, m.rig.Name)
+
+	// Load known route prefixes so the regex matches don't produce a flood of
+	// 'no route found for prefix' warnings on benign slugs like 'claude-code',
+	// 'keep-days', etc. Without this filter the bd-show layer fires a warning
+	// per candidate and the reconcile output becomes unreadable.
+	var knownPrefixes map[string]bool
+	townRoot := m.workDir
+	if m.rig.LocalRepo == "" {
+		// m.workDir is the rig's town dir; the town root is its parent.
+		townRoot = filepath.Dir(m.workDir)
+	} else {
+		// LocalRepo is set; find town root by walking up from rig dir.
+		townRoot = filepath.Dir(m.workDir)
+	}
+	if routes, err := beads.LoadRoutes(filepath.Join(townRoot, ".beads")); err == nil {
+		knownPrefixes = make(map[string]bool, len(routes))
+		for _, r := range routes {
+			knownPrefixes[r.Prefix] = true
+		}
+	}
+
+	return reconcileMergedPRsWith(ctx, lister, b, m.rig.DefaultBranch(), since, limit, m.output, m.workDir, m.rig.Name, knownPrefixes)
 }
 
 // reconcileMergedPRsWith is the testable core. It is parameterized over the
@@ -216,6 +250,7 @@ func reconcileMergedPRsWith(
 	out io.Writer,
 	workDir string,
 	rigName string,
+	knownPrefixes map[string]bool,
 ) (*ReconcileResult, error) {
 	if out == nil {
 		out = io.Discard
@@ -231,6 +266,23 @@ func reconcileMergedPRsWith(
 		ids := ExtractBeadIDs(pr.Title, pr.Body, pr.HeadRefName)
 		if len(ids) == 0 {
 			continue
+		}
+
+		// Filter to known route prefixes when available — avoids spamming
+		// bd-show with benign slugs that share the <letter-letter>-<chars>
+		// shape (e.g. 'claude-code', 'keep-days', 'code-review').
+		if knownPrefixes != nil {
+			filtered := ids[:0]
+			for _, id := range ids {
+				prefix := beads.ExtractPrefix(id)
+				if knownPrefixes[prefix] {
+					filtered = append(filtered, id)
+				}
+			}
+			ids = filtered
+			if len(ids) == 0 {
+				continue
+			}
 		}
 
 		for _, id := range ids {
