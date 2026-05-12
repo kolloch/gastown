@@ -7,8 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`gt mq reconcile-prs <rig>` safety net for auto-close-on-PR** — Scans
+  recently-merged PRs on the rig's default branch, extracts bead IDs from PR
+  title/body/head_ref_name, and force-closes any referenced beads that are
+  still open. Covers the gap where the primary auto-close path
+  (`Engineer.HandleMRInfoSuccess`) only fires for refinery-driven merges —
+  refinery-hotpatch PRs, contributor PRs, and any human-merged PR previously
+  left source beads OPEN. Each close + each failure logs and nudges mayor so
+  silent gaps surface without a status audit. Wired into `mol-refinery-patrol`
+  v15 as a new `reconcile-prs` step (hq-k6oai).
+
 ### Fixed
 
+- **Auto-close-on-PR observability** — `Engineer.HandleMRInfoSuccess` now logs
+  `WARNING` and nudges mayor when `ForceCloseWithReason` fails on the source
+  issue, instead of only logging to the engineer's local output. Previously
+  these failures were silent (output may not be tailed) and only discovered
+  via manual ledger audits (hq-k6oai).
 - **Daemon crash-loop vs Claude usage limits** — Stuck-agent-dog now inspects
   the agent's tmux pane for Claude usage-limit / rate-limit signatures before
   killing and restarting. Detected pauses apply a fixed retry delay

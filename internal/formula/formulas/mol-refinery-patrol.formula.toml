@@ -98,6 +98,7 @@ Abbreviated patrol rules:
 - **queue-scan**: Quick `gt mq list` check. If queue is empty, skip directly to check-integration-branches.
 - **process-branch through merge-push**: Only run if queue-scan found work. Otherwise SKIP all.
 - **loop-check through generate-summary**: SKIP if no merges were processed.
+- **reconcile-prs**: Always run (cheap safety net for externally-merged PRs).
 - **check-integration-branches**: Quick check only.
 - **context-check**: Quick self-assessment (one sentence).
 - **patrol-cleanup**: SKIP.
@@ -107,7 +108,7 @@ When `await-event` outputs `EFFORT: full`, run all steps thoroughly (normal mode
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-refinery-patrol"
-version = 14
+version = 15
 
 [vars]
 [vars.wisp_type]
@@ -833,9 +834,42 @@ If no: Continue to generate-summary.
 This tracking feeds into generate-summary for the patrol digest."""
 
 [[steps]]
+id = "reconcile-prs"
+title = "Reconcile externally-merged PRs (auto-close safety net)"
+needs = ["loop-check"]
+description = """
+Close beads referenced by PRs that were merged outside the refinery pipeline
+(hq-k6oai). The primary auto-close path only fires for refinery-driven
+merges — hotpatch PRs landed by hand on github.com, contributor PRs
+merged externally, etc., bypass it entirely. The reconciler is the safety
+net.
+
+```bash
+gt mq reconcile-prs {{rig}} --since-hours 24
+```
+
+The command:
+1. Lists PRs merged onto the rig's default branch in the lookback window.
+2. Extracts bead IDs from each PR's title, body, and head_ref_name.
+3. Force-closes any of those beads that are still open.
+4. Logs every close and every failure; nudges mayor on both (close-events
+   indicate the primary path was skipped — useful for spotting patterns).
+
+This step is idempotent and cheap when steady-state. If `since-hours 24`
+catches nothing in steady state, the typical patrol cost is a single
+`gh pr list` call.
+
+Track for generate-summary:
+- `prs_reconciled_closed`: count of beads closed by the reconciler
+- `prs_reconciled_failed`: count of close attempts that failed
+
+If close attempts FAIL (non-zero exit), do NOT skip — the command also
+nudges mayor. Note the failure in the summary and continue patrol."""
+
+[[steps]]
 id = "generate-summary"
 title = "Generate handoff summary"
-needs = ["loop-check"]
+needs = ["reconcile-prs"]
 description = """
 Summarize this patrol cycle.
 
