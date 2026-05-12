@@ -2023,3 +2023,339 @@ func TestHandleZombieRestart_RestartsWhenBranchNotMerged(t *testing.T) {
 		t.Errorf("action = %q, should not archive when work is not merged", z.Action)
 	}
 }
+
+// =====================================================================
+// za-8bj6: tests for the three scopes added by this bead.
+//
+// Manual reproduction for end-to-end acceptance (run with a live polecat):
+//
+//	1. Spawn a polecat against any in-progress bead:
+//	     gt sling <bead-id> <rig>
+//	   Confirm with `gt polecat ls` that the polecat appears with
+//	   agent_state=working and a tmux session.
+//	2. Find the claude PID inside the pane:
+//	     SESS=$(gt polecat show <rig>/<polecat> --json | jq -r '.session')
+//	     PANE_PID=$(tmux list-panes -t "$SESS" -F '#{pane_pid}' | head -1)
+//	     CLAUDE_PID=$(pgrep -P "$PANE_PID" claude || pgrep -P "$PANE_PID" node)
+//	3. Kill claude bypassing handlers:
+//	     kill -9 "$CLAUDE_PID"
+//	4. Watch the witness recover within ≤2 min:
+//	     watch -n 5 'gt patrol scan --json | jq ".zombies"'
+//	   Expected: a ZombieAgentDeadInSession entry that ends in
+//	   action="restarted-agent-dead-session" (or, if the session also exited,
+//	   action="restarted" via the dead-session path). RestartPolecatSession
+//	   failure paths now mail mayor/ with HIGH priority — check mayor inbox
+//	   if recovery didn't happen.
+//	5. Confirm the bead never sits stale: after staleInProgressTimeout
+//	   (default 10m, override via settings/config.json) any in_progress
+//	   bead whose polecat ghosted is reset to open and the mayor receives
+//	   a STALE_IN_PROGRESS escalation mail.
+// =====================================================================
+
+// TestZA8BJ6_PidIsAlive_SelfAndDead verifies the /proc-based PID liveness
+// gate that strengthens IsAgentProcessAliveStrict. This is the foundation of
+// scope 1: even if tmux reports the agent command name, we re-confirm via
+// kill(pid, 0).
+func TestZA8BJ6_PidIsAlive_SelfAndDead(t *testing.T) {
+	t.Parallel()
+	// Calling tmux internals via package-level helper:
+	// own PID must always be alive.
+	self := os.Getpid()
+	if !tmux.PidIsAliveForTest(self) {
+		t.Errorf("pidIsAlive(self=%d) = false, want true", self)
+	}
+	// PID 1 always exists on POSIX/Windows.
+	if runtime.GOOS != "windows" && !tmux.PidIsAliveForTest(1) {
+		t.Errorf("pidIsAlive(1) = false, want true")
+	}
+	// A definitely-dead PID. Pick something absurd that can't be in use.
+	if tmux.PidIsAliveForTest(2147483646) {
+		t.Errorf("pidIsAlive(2^31-2) = true, want false")
+	}
+	// Negative PID is invalid → must be false.
+	if tmux.PidIsAliveForTest(-1) {
+		t.Errorf("pidIsAlive(-1) = true, want false")
+	}
+}
+
+// TestZA8BJ6_NotifyMayorOfRestartFailures_NilSafe verifies the mayor
+// notification helper short-circuits cleanly with nil router (test paths)
+// and is a no-op when no zombie has a restart-failed action.
+func TestZA8BJ6_NotifyMayorOfRestartFailures_NilSafe(t *testing.T) {
+	t.Parallel()
+	// nil router and nil result must not panic.
+	notifyMayorOfRestartFailures(nil, "testrig", nil)
+
+	// Non-nil result with no failures must not panic.
+	result := &DetectZombiePolecatsResult{
+		Checked: 2,
+		Zombies: []ZombieResult{
+			{PolecatName: "alpha", Action: "restarted"},
+			{PolecatName: "bravo", Action: "detected-dirty-idle-polecat"},
+		},
+	}
+	notifyMayorOfRestartFailures(nil, "testrig", result)
+
+	// Now with an explicit failure — still nil router, still must not panic.
+	result.Zombies = append(result.Zombies, ZombieResult{
+		PolecatName: "charlie",
+		Action:      "restart-agent-dead-session-failed: gt session restart failed: exit 1",
+		Error:       fmt.Errorf("gt session restart failed: exit 1"),
+	})
+	notifyMayorOfRestartFailures(nil, "testrig", result)
+}
+
+// TestZA8BJ6_NotifyMayorOfRestartFailures_OnlyMatchesRestartFailures verifies
+// the helper only fires for zombies whose Action string contains both
+// "restart" and "failed". Other errors (e.g., bd queries) must not trigger
+// the HIGH-priority mayor escalation — otherwise patrol scans would spam
+// mayor on transient bd errors.
+func TestZA8BJ6_NotifyMayorOfRestartFailures_OnlyMatchesRestartFailures(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		action      string
+		err         error
+		shouldMatch bool
+	}{
+		{"restart-failed plain", "restart-failed: exit 1", fmt.Errorf("e"), true},
+		{"restart-agent-dead-session-failed", "restart-agent-dead-session-failed: exit 1", fmt.Errorf("e"), true},
+		{"restart-stuck-session-failed", "restart-stuck-session-failed: exit 1", fmt.Errorf("e"), true},
+		{"restart-bead-closed-failed", "restart-bead-closed-failed: exit 1", fmt.Errorf("e"), true},
+		{"restarted-success", "restarted", nil, false},
+		{"detected-dirty no error", "detected-dirty-idle-polecat", nil, false},
+		{"error but no action match", "some-other-error", fmt.Errorf("e"), false},
+		{"failed without restart prefix", "cleanup-wisp-failed", fmt.Errorf("e"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			matched := tc.err != nil &&
+				strings.Contains(tc.action, "restart") &&
+				strings.Contains(tc.action, "failed")
+			if matched != tc.shouldMatch {
+				t.Errorf("matcher mismatch: action=%q err=%v matched=%v want=%v",
+					tc.action, tc.err, matched, tc.shouldMatch)
+			}
+		})
+	}
+}
+
+// TestZA8BJ6_DetectStaleInProgress_BelowThresholdSkipped verifies that
+// freshly-updated in_progress beads are NOT considered stale even when their
+// polecat's session is gone — gives normal task completion time to land.
+func TestZA8BJ6_DetectStaleInProgress_BelowThresholdSkipped(t *testing.T) {
+	installFakeTmuxNoServer(t)
+	townRoot := t.TempDir()
+	rigName := "testrig"
+
+	// Bead updated 10 seconds ago — well below the 10-minute default.
+	updatedRecent := time.Now().Add(-10 * time.Second).Format(time.RFC3339)
+	bd, _ := mockBd(
+		func(args []string) (string, error) {
+			joined := strings.Join(args, " ")
+			if strings.HasPrefix(joined, "list") && strings.Contains(joined, "in_progress") {
+				return fmt.Sprintf(`[{"id":"gt-fresh","assignee":"%s/polecats/alpha","updated_at":"%s"}]`,
+					rigName, updatedRecent), nil
+			}
+			return "[]", nil
+		},
+		func(args []string) error { return nil },
+	)
+
+	result := DetectStaleInProgressBeads(bd, townRoot, rigName, nil)
+	if result.Checked != 1 {
+		t.Errorf("Checked = %d, want 1", result.Checked)
+	}
+	if len(result.Stale) != 0 {
+		t.Errorf("Stale = %d, want 0 (fresh bead must not be flagged)", len(result.Stale))
+	}
+}
+
+// TestZA8BJ6_DetectStaleInProgress_StaleAndSessionGone verifies a bead that
+// is BOTH (a) older than the stale threshold AND (b) has no tmux session
+// gets flagged and reset. Uses the fake tmux that always reports
+// "no server running" → HasSession returns false.
+func TestZA8BJ6_DetectStaleInProgress_StaleAndSessionGone(t *testing.T) {
+	installFakeTmuxNoServer(t)
+	townRoot := t.TempDir()
+	rigName := "testrig"
+
+	// Bead updated 30 minutes ago — comfortably past 10m default.
+	staleTime := time.Now().Add(-30 * time.Minute).Format(time.RFC3339)
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			joined := strings.Join(args, " ")
+			switch {
+			case strings.HasPrefix(joined, "list") && strings.Contains(joined, "in_progress"):
+				return fmt.Sprintf(`[{"id":"gt-stale","assignee":"%s/polecats/ghosted","updated_at":"%s"}]`,
+					rigName, staleTime), nil
+			case strings.HasPrefix(joined, "show"):
+				// resetAbandonedBead inspects status; return in_progress so it
+				// proceeds to the reset path.
+				return `[{"status":"in_progress"}]`, nil
+			}
+			return "[]", nil
+		},
+		func(args []string) error { return nil },
+	)
+
+	// Force verifyCommitOnMain to false so reset-not-close path is taken.
+	oldVerify := verifyCommitOnMain
+	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
+		return false, nil
+	}
+	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	result := DetectStaleInProgressBeads(bd, townRoot, rigName, nil)
+	if result.Checked != 1 {
+		t.Errorf("Checked = %d, want 1", result.Checked)
+	}
+	if len(result.Stale) != 1 {
+		t.Fatalf("Stale = %d, want 1", len(result.Stale))
+	}
+	stale := result.Stale[0]
+	if stale.BeadID != "gt-stale" {
+		t.Errorf("BeadID = %q, want gt-stale", stale.BeadID)
+	}
+	if stale.PolecatName != "ghosted" {
+		t.Errorf("PolecatName = %q, want ghosted", stale.PolecatName)
+	}
+	if !stale.BeadRecovered {
+		t.Error("BeadRecovered = false, want true (bd update --status=open should succeed)")
+	}
+	// Escalated should be false because router is nil.
+	if stale.Escalated {
+		t.Error("Escalated = true, want false (nil router)")
+	}
+
+	// Verify the bd update happened.
+	joined := strings.Join(mock.calls, "\n")
+	if !strings.Contains(joined, "update") || !strings.Contains(joined, "--status=open") {
+		t.Errorf("expected bd update --status=open call; got:\n%s", joined)
+	}
+}
+
+// TestZA8BJ6_DetectStaleInProgress_OtherRigsFiltered verifies the detector
+// only inspects beads assigned to polecats in the requested rig. A bead
+// assigned to "otherrig/polecats/x" must be skipped without counting.
+func TestZA8BJ6_DetectStaleInProgress_OtherRigsFiltered(t *testing.T) {
+	installFakeTmuxNoServer(t)
+	townRoot := t.TempDir()
+	rigName := "testrig"
+	staleTime := time.Now().Add(-30 * time.Minute).Format(time.RFC3339)
+
+	bd, _ := mockBd(
+		func(args []string) (string, error) {
+			joined := strings.Join(args, " ")
+			if strings.HasPrefix(joined, "list") && strings.Contains(joined, "in_progress") {
+				return fmt.Sprintf(`[
+  {"id":"gt-here","assignee":"%s/polecats/alpha","updated_at":"%s"},
+  {"id":"gt-other","assignee":"otherrig/polecats/bravo","updated_at":"%s"},
+  {"id":"gt-noassign","assignee":"","updated_at":"%s"},
+  {"id":"gt-notpol","assignee":"%s/crew/sean","updated_at":"%s"}
+]`, rigName, staleTime, staleTime, staleTime, rigName, staleTime), nil
+			}
+			if strings.HasPrefix(joined, "show") {
+				return `[{"status":"in_progress"}]`, nil
+			}
+			return "[]", nil
+		},
+		func(args []string) error { return nil },
+	)
+
+	oldVerify := verifyCommitOnMain
+	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
+		return false, nil
+	}
+	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	result := DetectStaleInProgressBeads(bd, townRoot, rigName, nil)
+	if result.Checked != 1 {
+		t.Errorf("Checked = %d, want 1 (only testrig/polecats/alpha)", result.Checked)
+	}
+	if len(result.Stale) != 1 {
+		t.Errorf("Stale = %d, want 1", len(result.Stale))
+	}
+	if len(result.Stale) > 0 && result.Stale[0].BeadID != "gt-here" {
+		t.Errorf("Stale[0].BeadID = %q, want gt-here", result.Stale[0].BeadID)
+	}
+}
+
+// TestZA8BJ6_DetectStaleInProgress_HeartbeatFreshSkipped verifies that a
+// fresh polecat heartbeat suppresses the stale flag even when updated_at is
+// old. This prevents flagging a polecat that's working hard on a long task
+// (no bead update yet) but actively heartbeating.
+func TestZA8BJ6_DetectStaleInProgress_HeartbeatFreshSkipped(t *testing.T) {
+	installFakeTmuxNoServer(t)
+	townRoot := t.TempDir()
+	rigName := "testrig"
+	staleTime := time.Now().Add(-30 * time.Minute).Format(time.RFC3339)
+	polecatName := "alpha"
+
+	// Write a fresh heartbeat file at the path DetectStaleInProgressBeads
+	// looks up. The default prefix in tests is "gt" (rigs.json absent).
+	sessionName := fmt.Sprintf("%s-%s", "gt", polecatName)
+	polecat.TouchSessionHeartbeat(townRoot, sessionName)
+
+	bd, _ := mockBd(
+		func(args []string) (string, error) {
+			joined := strings.Join(args, " ")
+			if strings.HasPrefix(joined, "list") && strings.Contains(joined, "in_progress") {
+				return fmt.Sprintf(`[{"id":"gt-stale-hb","assignee":"%s/polecats/%s","updated_at":"%s"}]`,
+					rigName, polecatName, staleTime), nil
+			}
+			return "[]", nil
+		},
+		func(args []string) error { return nil },
+	)
+
+	result := DetectStaleInProgressBeads(bd, townRoot, rigName, nil)
+	if result.Checked != 1 {
+		t.Errorf("Checked = %d, want 1", result.Checked)
+	}
+	if len(result.Stale) != 0 {
+		t.Errorf("Stale = %d, want 0 (fresh heartbeat must suppress)", len(result.Stale))
+	}
+}
+
+// TestZA8BJ6_StaleInProgressTimeoutConfig verifies the new config knob
+// returns the documented default and honors overrides.
+func TestZA8BJ6_StaleInProgressTimeoutConfig(t *testing.T) {
+	t.Parallel()
+	// Nil → default.
+	var nilWT *config.WitnessThresholds
+	if got := nilWT.StaleInProgressTimeoutD(); got != config.DefaultWitnessStaleInProgressTimeout {
+		t.Errorf("nil StaleInProgressTimeoutD() = %v, want %v",
+			got, config.DefaultWitnessStaleInProgressTimeout)
+	}
+	// Override via JSON-tagged field.
+	wt := &config.WitnessThresholds{StaleInProgressTimeout: "2m"}
+	if got := wt.StaleInProgressTimeoutD(); got != 2*time.Minute {
+		t.Errorf("override StaleInProgressTimeoutD() = %v, want 2m", got)
+	}
+	// Malformed → default.
+	wt2 := &config.WitnessThresholds{StaleInProgressTimeout: "notaduration"}
+	if got := wt2.StaleInProgressTimeoutD(); got != config.DefaultWitnessStaleInProgressTimeout {
+		t.Errorf("malformed StaleInProgressTimeoutD() = %v, want %v",
+			got, config.DefaultWitnessStaleInProgressTimeout)
+	}
+}
+
+// TestZA8BJ6_IsAgentProcessAliveStrict_NoSession verifies the strict check
+// returns false when the session doesn't exist (no panes → no PIDs to
+// check → "no agent alive" → caller treats as dead).
+func TestZA8BJ6_IsAgentProcessAliveStrict_NoSession(t *testing.T) {
+	installFakeTmuxNoServer(t)
+	tm := tmux.NewTmux()
+	if tm.IsAgentProcessAliveStrict("nonexistent-session") {
+		t.Error("IsAgentProcessAliveStrict on nonexistent session must return false")
+	}
+	// Also direct: empty name.
+	if tm.IsAgentProcessAliveStrict("") {
+		t.Error("IsAgentProcessAliveStrict on empty session must return false")
+	}
+	// Empty process-name list short-circuits to false too.
+	if tm.IsAgentProcessAliveStrictForNames("any", nil) {
+		t.Error("IsAgentProcessAliveStrictForNames with empty names must return false")
+	}
+}

@@ -1242,7 +1242,74 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 	// check if the issue belongs to a convoy and track the failure.
 	trackConvoyFailures(bd, workDir, result)
 
+	// za-8bj6 (scope 2): Surface RestartPolecatSession failures to mayor. Today
+	// these failures stay buried in the zombie's Error field and the patrol
+	// scan's normal POLECAT_DIED notification masks them. The mayor needs an
+	// explicit HIGH-priority signal so a failed auto-recovery is visible.
+	notifyMayorOfRestartFailures(router, rigName, result)
+
 	return result
+}
+
+// notifyMayorOfRestartFailures inspects zombie detection results and emits a
+// HIGH-priority mayor mail for every zombie whose RestartPolecatSession (or
+// related restart action) failed. Without this, restart failures are invisible
+// — the polecat stays dead and the bead stays in_progress until the next scan
+// catches it via the stale-in-progress detector. (za-8bj6)
+//
+// Best-effort: nil router (test paths) just skips. Mail failures are logged
+// to stderr but never block detection.
+func notifyMayorOfRestartFailures(router *mail.Router, rigName string, result *DetectZombiePolecatsResult) {
+	if router == nil || result == nil {
+		return
+	}
+	for _, z := range result.Zombies {
+		if z.Error == nil {
+			continue
+		}
+		// Only escalate restart failures — other errors (e.g., bd query) are
+		// noise. The Action field is tagged with "restart-...-failed" by the
+		// restart paths.
+		if !strings.Contains(z.Action, "restart") || !strings.Contains(z.Action, "failed") {
+			continue
+		}
+		subject := fmt.Sprintf("RESTART_FAILED %s/%s (%s)", rigName, z.PolecatName, z.Classification)
+		body := fmt.Sprintf(`Witness attempted to restart a zombie polecat and the restart failed.
+
+Polecat: %s/%s
+Classification: %s
+Agent state: %s
+Hook bead: %s
+Action taken: %s
+Error: %v
+
+The polecat session was not recovered. Investigate the failure (likely 'gt session
+restart' failure — sandbox missing, branch conflict, or sling-side error) and either
+restart the session manually or nuke the polecat.
+
+za-8bj6: this notification was added because silent restart failures stranded
+hooked beads in_progress across overnight runs.`,
+			rigName, z.PolecatName, z.Classification, z.AgentState, z.HookBead, z.Action, z.Error)
+		msg := &mail.Message{
+			From:     fmt.Sprintf("%s/witness", rigName),
+			To:       "mayor/",
+			Subject:  subject,
+			Priority: mail.PriorityHigh,
+			Body:     body,
+		}
+		if err := router.Send(msg); err != nil {
+			fmt.Fprintf(os.Stderr, "witness: failed to send RESTART_FAILED mail for %s/%s: %v\n",
+				rigName, z.PolecatName, err)
+			// Nudge fallback: mayor session may not be ready for mail.
+			t := tmux.NewTmux()
+			nudge := fmt.Sprintf("RESTART_FAILED %s/%s (%s) hook=%s error=%v — manual recovery needed",
+				rigName, z.PolecatName, z.Classification, z.HookBead, z.Error)
+			if nerr := t.NudgeSession(session.MayorSessionName(), nudge); nerr != nil {
+				fmt.Fprintf(os.Stderr, "witness: nudge fallback to mayor also failed for %s/%s: %v\n",
+					rigName, z.PolecatName, nerr)
+			}
+		}
+	}
 }
 
 // detectZombieLiveSession checks a polecat with a live tmux session for zombie indicators:
@@ -1318,7 +1385,15 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 
 	// Tmux alive but agent process dead (gt-kj6r6).
 	// gt-dsgp: Restart instead of nuke — preserve worktree and branch.
-	if !t.IsAgentAlive(sessionName) {
+	//
+	// za-8bj6: Two-pronged check. IsAgentAlive trusts tmux's pane_current_command
+	// and pgrep tree. That misses the "silent claude death" case where the pane
+	// command is stale or where ps reports a name match but the PID is gone.
+	// IsAgentProcessAliveStrict enumerates pane PIDs and confirms at least one
+	// matching descendant is alive via kill(pid, 0). The agent is considered
+	// dead if EITHER check fails — strict is a true superset (only escalates),
+	// so this doesn't soften the existing logic.
+	if !t.IsAgentAlive(sessionName) || !t.IsAgentProcessAliveStrict(sessionName) {
 		zombie := ZombieResult{
 			PolecatName:    polecatName,
 			AgentState:     snapState,
@@ -2828,4 +2903,193 @@ func getAgentActiveMR(bd *BdCli, workDir, agentBeadID string) string {
 		return ""
 	}
 	return issues[0].ActiveMR
+}
+
+// StaleInProgressBeadResult describes a single bead detected as "stale
+// in_progress": the bead has been in_progress for longer than the configured
+// timeout AND its assignee polecat has no tmux session AND no fresh heartbeat
+// was found, so the assignee is presumed dead. (za-8bj6)
+type StaleInProgressBeadResult struct {
+	BeadID        string
+	Assignee      string        // "rigname/polecats/polecatname"
+	PolecatName   string        // Extracted from assignee
+	StalenessAge  time.Duration // time.Since(updated_at)
+	HeartbeatAge  time.Duration // time.Since(heartbeat.Timestamp), or 0 if no heartbeat
+	BeadRecovered bool          // true if reset to open
+	Escalated     bool          // true if mayor mail sent
+	Error         error
+}
+
+// DetectStaleInProgressBeadsResult holds aggregate results.
+type DetectStaleInProgressBeadsResult struct {
+	Checked int                         // Number of in_progress beads inspected
+	Stale   []StaleInProgressBeadResult // Stale beads found
+	Errors  []error
+}
+
+// DetectStaleInProgressBeads scans every in_progress bead assigned to a polecat
+// in this rig and recovers any bead that satisfies ALL of:
+//
+//  1. updated_at is older than the configured stale-in-progress timeout
+//     (default 10 minutes, configurable via WitnessThresholds.StaleInProgressTimeout).
+//  2. The assignee polecat's tmux session is gone (HasSession=false).
+//  3. There is no fresh polecat heartbeat for the assignee session.
+//
+// Recovery: reset bead to open with empty assignee, then send a HIGH-priority
+// mayor mail describing the stale bead so the operator can re-sling or
+// investigate. Uses the existing resetAbandonedBead helper for the bead reset
+// (sharing respawn-counter + spawn-storm circuit-breaker behavior with the
+// orphaned-bead path).
+//
+// Differs from DetectOrphanedBeads:
+//   - DetectOrphanedBeads requires the polecat directory to be gone too. This
+//     detector fires even when the polecat directory still exists, which is
+//     the common "ghosted polecat" symptom: the bead is still in_progress,
+//     the polecat dir is still there, but the session and process are gone.
+//   - This detector also requires a fresh heartbeat to be absent so we don't
+//     reset beads belonging to a polecat that's heartbeating but whose tmux
+//     session just hiccupped.
+//
+// za-8bj6.
+func DetectStaleInProgressBeads(bd *BdCli, workDir, rigName string, router *mail.Router) *DetectStaleInProgressBeadsResult {
+	result := &DetectStaleInProgressBeadsResult{}
+
+	townRoot, err := workspace.Find(workDir)
+	if err != nil || townRoot == "" {
+		townRoot = workDir
+	}
+	initRegistryFromTownRoot(townRoot)
+
+	witCfg := config.LoadOperationalConfig(townRoot).GetWitnessConfig()
+	staleTimeout := witCfg.StaleInProgressTimeoutD()
+
+	output, err := bd.Exec(workDir, "list", "--status=in_progress", "--json", "--limit=0")
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Errorf("listing in_progress beads: %w", err))
+		return result
+	}
+	if output == "" {
+		return result
+	}
+
+	var beadList []struct {
+		ID        string `json:"id"`
+		Assignee  string `json:"assignee"`
+		UpdatedAt string `json:"updated_at"`
+	}
+	if err := json.Unmarshal([]byte(output), &beadList); err != nil {
+		result.Errors = append(result.Errors, fmt.Errorf("parsing in_progress beads: %w", err))
+		return result
+	}
+
+	t := tmux.NewTmux()
+
+	for _, bead := range beadList {
+		if bead.Assignee == "" {
+			continue
+		}
+		// Assignee must be "rigname/polecats/polecatname".
+		parts := strings.Split(bead.Assignee, "/")
+		if len(parts) != 3 || parts[1] != "polecats" {
+			continue
+		}
+		assigneeRig, polecatName := parts[0], parts[2]
+		if assigneeRig != rigName {
+			continue
+		}
+		result.Checked++
+
+		// Parse updated_at.
+		updatedAt, perr := time.Parse(time.RFC3339, bead.UpdatedAt)
+		if perr != nil {
+			updatedAt, perr = time.Parse("2006-01-02 15:04:05", bead.UpdatedAt)
+			if perr != nil {
+				// Unparseable — skip to avoid false recovery.
+				continue
+			}
+		}
+		age := time.Since(updatedAt)
+		if age < staleTimeout {
+			continue
+		}
+
+		// Tmux session must be gone.
+		sessionName := session.PolecatSessionName(session.PrefixFor(assigneeRig), polecatName)
+		alive, sessErr := t.HasSession(sessionName)
+		if sessErr != nil {
+			result.Errors = append(result.Errors,
+				fmt.Errorf("checking session %s for bead %s: %w", sessionName, bead.ID, sessErr))
+			continue
+		}
+		if alive {
+			continue
+		}
+
+		// No fresh heartbeat.
+		var heartbeatAge time.Duration
+		if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil {
+			heartbeatAge = time.Since(hb.Timestamp)
+			if heartbeatAge < polecat.SessionHeartbeatStaleThreshold {
+				continue
+			}
+		}
+
+		// Confirmed stale. Recover.
+		stale := StaleInProgressBeadResult{
+			BeadID:       bead.ID,
+			Assignee:     bead.Assignee,
+			PolecatName:  polecatName,
+			StalenessAge: age,
+			HeartbeatAge: heartbeatAge,
+		}
+		stale.BeadRecovered = resetAbandonedBead(bd, workDir, assigneeRig, bead.ID, polecatName, router)
+
+		// Escalate to mayor regardless of resetAbandonedBead outcome — even when
+		// the bead is closed (e.g., work-already-on-main), the mayor needs to
+		// know a stale-in-progress was detected so the pattern can be tracked.
+		if router != nil {
+			subject := fmt.Sprintf("STALE_IN_PROGRESS %s (polecat %s/%s ghosted)", bead.ID, assigneeRig, polecatName)
+			body := fmt.Sprintf(`A bead has been in_progress longer than the configured stale threshold
+AND its assignee polecat's tmux session is gone (with no fresh heartbeat).
+The witness has reset the bead so dispatch can re-route it.
+
+Bead: %s
+Assignee: %s (now cleared)
+Polecat: %s/%s
+Updated-at age: %v (threshold: %v)
+Heartbeat age: %v (threshold: %v, 0 = no heartbeat file)
+BeadRecovered: %v
+
+Likely cause: claude died silently inside the tmux session (rate limit, OOM,
+silent crash) — see za-8bj6. No manual action needed if BeadRecovered=true;
+investigate if it keeps recurring for the same polecat.`,
+				bead.ID, bead.Assignee, assigneeRig, polecatName,
+				age.Round(time.Second), staleTimeout,
+				heartbeatAge.Round(time.Second), polecat.SessionHeartbeatStaleThreshold,
+				stale.BeadRecovered)
+			msg := &mail.Message{
+				From:     fmt.Sprintf("%s/witness", rigName),
+				To:       "mayor/",
+				Subject:  subject,
+				Priority: mail.PriorityHigh,
+				Body:     body,
+			}
+			if err := router.Send(msg); err != nil {
+				fmt.Fprintf(os.Stderr, "witness: failed to send STALE_IN_PROGRESS mail for %s: %v\n",
+					bead.ID, err)
+				// Nudge fallback.
+				nudge := fmt.Sprintf("STALE_IN_PROGRESS %s (%s/%s, age=%v) — bead reset, please re-sling",
+					bead.ID, assigneeRig, polecatName, age.Round(time.Second))
+				if nerr := t.NudgeSession(session.MayorSessionName(), nudge); nerr != nil {
+					fmt.Fprintf(os.Stderr, "witness: nudge fallback for %s also failed: %v\n", bead.ID, nerr)
+				}
+			} else {
+				stale.Escalated = true
+			}
+		}
+
+		result.Stale = append(result.Stale, stale)
+	}
+
+	return result
 }
