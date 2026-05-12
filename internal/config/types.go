@@ -491,6 +491,12 @@ type WitnessThresholds struct {
 	// possibly stuck at startup (e.g., auth 401 blocking initialization, default "5m").
 	// The witness exposes the signal; patrol formula decides whether to escalate.
 	HeartbeatStartupGrace string `json:"heartbeat_startup_grace,omitempty"`
+
+	// StaleInProgressTimeout is how long a bead may sit in_progress without any
+	// updated_at refresh or fresh polecat heartbeat before the witness considers
+	// it "stale" and (if the assignee polecat's tmux session is gone) resets it
+	// to open + escalates to mayor. Default "10m". (za-8bj6)
+	StaleInProgressTimeout string `json:"stale_in_progress_timeout,omitempty"`
 }
 
 // DefaultOperationalConfig returns an OperationalConfig with all defaults.

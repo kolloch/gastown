@@ -112,6 +112,9 @@ const (
 	DefaultWitnessDoneIntentStuckTimeout    = 60 * time.Second
 	DefaultWitnessDoneIntentRecentGrace     = 30 * time.Second
 	DefaultWitnessHeartbeatStartupGrace     = 5 * time.Minute
+	// DefaultWitnessStaleInProgressTimeout: how long a bead may sit in_progress
+	// without a heartbeat or update before being considered stale (za-8bj6).
+	DefaultWitnessStaleInProgressTimeout = 10 * time.Minute
 )
 
 // LoadOperationalConfig loads operational config from a town root.
@@ -742,4 +745,14 @@ func (wt *WitnessThresholds) HeartbeatStartupGraceD() time.Duration {
 		return ParseDurationOrDefault(wt.HeartbeatStartupGrace, DefaultWitnessHeartbeatStartupGrace)
 	}
 	return DefaultWitnessHeartbeatStartupGrace
+}
+
+// StaleInProgressTimeoutD returns the configured or default stale in_progress
+// bead timeout. Beads whose updated_at is older than this AND whose assignee
+// polecat has no tmux session are reset to open + escalated to mayor. (za-8bj6)
+func (wt *WitnessThresholds) StaleInProgressTimeoutD() time.Duration {
+	if wt != nil {
+		return ParseDurationOrDefault(wt.StaleInProgressTimeout, DefaultWitnessStaleInProgressTimeout)
+	}
+	return DefaultWitnessStaleInProgressTimeout
 }

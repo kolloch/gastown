@@ -148,13 +148,20 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 
-	// Run all three detection passes.
-	// Note: DetectZombiePolecats takes a router param but does NOT send mail
-	// internally — it only uses the router for workspace context. Notifications
-	// are sent exclusively below via --notify, avoiding double-send.
+	// Run all four detection passes.
+	// Note: DetectZombiePolecats now sends mayor mail for restart failures
+	// (za-8bj6 scope 2). The --notify path still emits the aggregate
+	// POLECAT_DIED notification below; the two are complementary (one per
+	// failure vs one per scan).
 	zombieResult := witness.DetectZombiePolecats(bd, workDir, rigName, router)
 	stallResult := witness.DetectStalledPolecats(workDir, rigName)
 	completionResult := witness.DiscoverCompletions(bd, workDir, rigName, router)
+	// za-8bj6 scope 3: stale-in-progress beads (polecat ghosted, bead stuck).
+	staleBeadResult := witness.DetectStaleInProgressBeads(bd, workDir, rigName, router)
+	if staleBeadResult != nil && len(staleBeadResult.Stale) > 0 {
+		fmt.Fprintf(os.Stderr, "patrol scan: detected %d stale in_progress bead(s); mayor notified (za-8bj6)\n",
+			len(staleBeadResult.Stale))
+	}
 
 	// Build patrol receipts for zombies
 	receipts := witness.BuildPatrolReceipts(rigName, zombieResult)

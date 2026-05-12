@@ -2744,6 +2744,158 @@ func (t *Tmux) IsAgentAlive(session string) bool {
 	return t.IsRuntimeRunning(session, t.resolveSessionProcessNames(session))
 }
 
+// IsAgentProcessAliveStrict performs a stricter, /proc-based liveness check for
+// the agent process inside a tmux session. Unlike IsAgentAlive (which trusts
+// tmux's pane_current_command), this enumerates every pane PID in the session
+// and walks the process tree, requiring at least one descendant PID (or the
+// pane PID itself) to be ALIVE on the OS AND named like the agent binary.
+//
+// This catches the "silent claude death" case: tmux still reports the pane
+// command as "claude" (or shows a stale pane_current_command), but the actual
+// claude process exited. The witness needs to distinguish "tmux session
+// present + claude alive" from "tmux session present + claude dead" so the
+// restart-first path fires (za-8bj6).
+//
+// Behavior:
+//   - Returns false if the session has no panes (caller should treat as dead).
+//   - For each pane PID: walks the descendant tree (via pgrep -P on POSIX,
+//     wmic on Windows) looking for a process whose comm matches one of the
+//     resolved process names. Uses pidIsAlive (kill(pid, 0) on POSIX) to
+//     confirm the matched PID is actually still alive on the OS.
+//   - Returns true on first confirmed live match.
+//
+// Manual reproduction (acceptance for za-8bj6):
+//  1. Spawn a polecat with `gt polecat spawn <rig> <bead>`.
+//  2. Find the polecat's tmux session (e.g., `g3-rictus-alpha`).
+//  3. In another shell, find the claude PID:
+//     `tmux list-panes -t <session> -F '#{pane_pid}'` then `pgrep -P <panePID>`.
+//  4. Kill the claude process: `kill -9 <claudePID>` (use -9 to skip handlers).
+//  5. Within ≤2 minutes, the witness patrol should detect the dead agent and
+//     run RestartPolecatSession to restore the session.
+func (t *Tmux) IsAgentProcessAliveStrict(session string) bool {
+	names := t.resolveSessionProcessNames(session)
+	return t.IsAgentProcessAliveStrictForNames(session, names)
+}
+
+// IsAgentProcessAliveStrictForNames is like IsAgentProcessAliveStrict but lets
+// the caller supply the expected process names directly. Useful for tests and
+// callers that already resolved the names. (za-8bj6)
+func (t *Tmux) IsAgentProcessAliveStrictForNames(session string, processNames []string) bool {
+	if session == "" || len(processNames) == 0 {
+		return false
+	}
+	names := processNamesForSession(t, session, processNames)
+	if len(names) == 0 {
+		return false
+	}
+
+	// Enumerate pane PIDs across all windows in the session.
+	out, err := t.run("list-panes", "-s", "-t", session, "-F", "#{pane_pid}")
+	if err != nil {
+		return false
+	}
+	pidLines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(pidLines) == 0 {
+		return false
+	}
+
+	for _, pid := range pidLines {
+		pid = strings.TrimSpace(pid)
+		if pid == "" {
+			continue
+		}
+		// Direct PID match: the pane process itself is the agent.
+		if processMatchesNamesAndAlive(pid, names) {
+			return true
+		}
+		// Descendant match: walk children for an agent-named process.
+		if hasLiveDescendantWithNames(pid, names, 0) {
+			return true
+		}
+	}
+	return false
+}
+
+// processMatchesNamesAndAlive is like processMatchesNames but also confirms
+// the PID is currently alive on the OS via kill(pid, 0) / OpenProcess.
+// Used by IsAgentProcessAliveStrict to defeat stale tmux pane_current_command. (za-8bj6)
+func processMatchesNamesAndAlive(pid string, names []string) bool {
+	if !processMatchesNames(pid, names) {
+		return false
+	}
+	return pidIsAlive(pid)
+}
+
+// hasLiveDescendantWithNames walks the descendant tree for a named process AND
+// confirms the matched PID is alive on the OS. Companion to processMatchesNamesAndAlive.
+// (za-8bj6)
+func hasLiveDescendantWithNames(pid string, names []string, depth int) bool {
+	const maxDepth = 10
+	if len(names) == 0 || depth > maxDepth {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		// On Windows the existing descendant scan is good enough — we don't
+		// have an easy kill(pid, 0) equivalent here. Defer to the standard
+		// path; it's already /proc-equivalent (wmic) on Windows.
+		return hasDescendantWithNamesWindows(pid, names, depth)
+	}
+	return hasLiveDescendantWithNamesPosix(pid, names, depth)
+}
+
+// hasLiveDescendantWithNamesPosix walks children via pgrep and confirms each
+// matched PID is alive on the OS via kill(pid, 0). (za-8bj6)
+func hasLiveDescendantWithNamesPosix(pid string, names []string, depth int) bool {
+	const maxDepth = 10
+	if depth > maxDepth {
+		return false
+	}
+	cmd := exec.Command("pgrep", "-P", pid, "-l")
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	nameSet := make(map[string]bool, len(names))
+	for _, n := range names {
+		nameSet[n] = true
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		childPid, childName := parts[0], parts[1]
+		if nameSet[childName] && pidIsAlive(childPid) {
+			return true
+		}
+		// Also try the canonical comm via ps (handles renamed argv[0]).
+		if processMatchesNamesAndAlive(childPid, names) {
+			return true
+		}
+		if hasLiveDescendantWithNamesPosix(childPid, names, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+// pidIsAlive reports whether the given PID is alive on the OS.
+// Implementation lives in pid_alive_unix.go / pid_alive_windows.go. (za-8bj6)
+func pidIsAlive(pidStr string) bool {
+	if pidStr == "" {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(pidStr))
+	if err != nil || pid <= 0 {
+		return false
+	}
+	return pidIsAlivePlatform(pid)
+}
+
 // resolveSessionProcessNames returns the process names to check for a session.
 // Prefers GT_PROCESS_NAMES (set at startup, handles custom agents that shadow
 // built-in presets). Falls back to GT_AGENT-based lookup for legacy sessions.
