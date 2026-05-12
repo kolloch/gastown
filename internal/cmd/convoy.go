@@ -352,6 +352,50 @@ Examples:
 	RunE:         runConvoyClose,
 }
 
+// convoyForceDispatchCmd is the operator escape hatch for hq-mzjyu.
+//
+// The daemon applies per-convoy exponential backoff to the completion-check
+// path (see internal/daemon/convoy_manager.go: shouldCheckStuck). A convoy
+// stuck on the same tracked/ready counts gets re-checked at 1m → 2m → 4m
+// → 8m. That's intentional — repeated no-op checks hammer Dolt — but it
+// means a convoy that became feedable mid-cooldown waits longer than
+// necessary before the daemon picks it up.
+//
+// This command performs a one-shot manual dispatch outside the daemon's
+// cooldown: it queries `gt convoy stranded`, finds the target, and either
+// slings the first ready issue or runs `gt convoy check`. Use it when an
+// operator knows a convoy should be dispatchable NOW.
+//
+// Note: this does not poke into the daemon's in-memory cooldown map (there
+// is no daemon-IPC channel today). The daemon's own backoff resets
+// naturally on the next tick where tracked/ready counts have changed,
+// which is what successful manual dispatch produces.
+var convoyForceDispatchCmd = &cobra.Command{
+	Use:   "force-dispatch <convoy-id>",
+	Short: "Bypass daemon cooldown and dispatch a convoy immediately",
+	Long: `Force a one-shot dispatch for a single convoy, bypassing the daemon's
+per-convoy exponential backoff (hq-mzjyu).
+
+The daemon throttles repeated no-op checks on stuck convoys (1m → 8m
+backoff). When an operator knows a convoy should be dispatchable NOW —
+e.g., after manually unblocking a dependency or restarting an agent —
+this command runs the same logic the daemon's scan would, but immediately
+and only for the specified convoy.
+
+Behavior:
+  - If the convoy has ready issues, the first one is slung.
+  - If the convoy has tracked but unready issues, ` + "`gt convoy check`" + ` is run
+    (closes the convoy if all tracked issues are closed; no-op otherwise).
+  - If the convoy is not in the stranded list, this command exits non-zero.
+
+Examples:
+  gt convoy force-dispatch hq-wf-fnvgm
+  gt convoy force-dispatch hq-cv-abc`,
+	Args:         cobra.ExactArgs(1),
+	SilenceUsage: true,
+	RunE:         runConvoyForceDispatch,
+}
+
 var convoyLandCmd = &cobra.Command{
 	Use:   "land <convoy-id>",
 	Short: "Land an owned convoy (cleanup worktrees, close convoy)",
@@ -427,6 +471,7 @@ func init() {
 	convoyCmd.AddCommand(convoyStrandedCmd)
 	convoyCmd.AddCommand(convoyCloseCmd)
 	convoyCmd.AddCommand(convoyLandCmd)
+	convoyCmd.AddCommand(convoyForceDispatchCmd)
 	convoyCmd.AddCommand(convoyStageCmd)
 	convoyCmd.AddCommand(convoyLaunchCmd)
 
@@ -885,6 +930,98 @@ func runConvoyCheck(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// runConvoyForceDispatch implements `gt convoy force-dispatch <id>`.
+//
+// Performs a single dispatch attempt against one specific convoy, mirroring
+// the daemon's scan logic but bypassing its in-memory cooldown. This is
+// the operator escape hatch from hq-mzjyu.
+func runConvoyForceDispatch(cmd *cobra.Command, args []string) error {
+	convoyID := strings.TrimSpace(args[0])
+	if convoyID == "" {
+		return fmt.Errorf("convoy ID is required")
+	}
+
+	townBeads, err := getTownBeadsDir()
+	if err != nil {
+		return err
+	}
+
+	// Re-use the same stranded query the daemon uses so we see the same
+	// view of "ready vs stuck vs empty" for this convoy.
+	stranded, err := findStrandedConvoys(townBeads)
+	if err != nil {
+		return fmt.Errorf("finding stranded convoys: %w", err)
+	}
+
+	var target *strandedConvoyInfo
+	for i := range stranded {
+		if stranded[i].ID == convoyID {
+			target = &stranded[i]
+			break
+		}
+	}
+	if target == nil {
+		// Not stranded — either the convoy is closed, fully assigned with
+		// live workers, or doesn't exist. Give the operator a clear signal
+		// rather than silently doing nothing.
+		return fmt.Errorf("convoy %s is not stranded (closed, fully assigned, or unknown); nothing to force-dispatch", convoyID)
+	}
+
+	fmt.Printf("%s Force-dispatching convoy %s (%d tracked, %d ready)\n",
+		style.Bold.Render("→"), target.ID, target.TrackedCount, target.ReadyCount)
+
+	// Case 1: empty convoy → run convoy check (which auto-closes if appropriate).
+	if target.TrackedCount == 0 {
+		fmt.Printf("  Convoy is empty — running `gt convoy check %s`\n", target.ID)
+		return checkSingleConvoy(townBeads, target.ID, false)
+	}
+
+	// Case 2: tracked but no ready issues → completion check (will close if
+	// all closed; otherwise no-op).
+	if target.ReadyCount == 0 {
+		fmt.Printf("  No ready issues — running `gt convoy check %s` (auto-close if complete)\n", target.ID)
+		return checkSingleConvoy(townBeads, target.ID, false)
+	}
+
+	// Case 3: ready issues exist → sling the first one whose rig is resolvable.
+	var lastErr error
+	for _, issueID := range target.ReadyIssues {
+		prefix := beads.ExtractPrefix(issueID)
+		if prefix == "" {
+			fmt.Printf("  Skipping %s: no prefix\n", issueID)
+			continue
+		}
+		townRoot := filepath.Dir(townBeads) // .beads → townRoot
+		rig := beads.GetRigNameForPrefix(townRoot, prefix)
+		if rig == "" {
+			fmt.Printf("  Skipping %s: no rig route for prefix %s\n", issueID, prefix)
+			continue
+		}
+
+		fmt.Printf("  Slinging %s → %s\n", issueID, rig)
+		slingArgs := []string{"sling", issueID, rig, "--no-boot"}
+		if target.BaseBranch != "" {
+			slingArgs = append(slingArgs, "--base-branch="+target.BaseBranch)
+		}
+		slingCmd := exec.Command("gt", slingArgs...) //nolint:gosec // operator-invoked args
+		slingCmd.Dir = townRoot
+		slingCmd.Stdout = os.Stdout
+		slingCmd.Stderr = os.Stderr
+		if err := slingCmd.Run(); err != nil {
+			lastErr = err
+			fmt.Printf("  sling failed for %s: %v — trying next ready issue\n", issueID, err)
+			continue
+		}
+		fmt.Printf("%s Dispatched %s\n", style.Bold.Render("✓"), issueID)
+		return nil
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("all %d ready issues failed to dispatch: last error: %w", len(target.ReadyIssues), lastErr)
+	}
+	return fmt.Errorf("no dispatchable issues in convoy %s (all %d skipped due to missing rig routes)", target.ID, len(target.ReadyIssues))
 }
 
 // closeConvoyIfComplete checks whether all tracked issues in a convoy are resolved

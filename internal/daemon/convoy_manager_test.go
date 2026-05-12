@@ -2446,3 +2446,212 @@ func TestPollStore_InfNaNError_AdvancesHWMAndReturnsNil(t *testing.T) {
 		})
 	}
 }
+
+// --- hq-mzjyu: Per-convoy completion-check backoff ---
+
+// TestShouldCheckStuck_FirstObservationChecks verifies that a previously
+// unseen convoy is checked immediately (no cooldown gate on first sight).
+func TestShouldCheckStuck_FirstObservationChecks(t *testing.T) {
+	m := NewConvoyManager(t.TempDir(), func(string, ...interface{}) {}, "gt", 10*time.Minute, nil, nil, nil)
+	if !m.shouldCheckStuck("hq-cv-new", 5, 0) {
+		t.Fatal("first observation of stuck convoy should return true")
+	}
+	// State should now exist with min backoff
+	st := m.checkCooldown["hq-cv-new"]
+	if st == nil {
+		t.Fatal("expected cooldown state to be created on first observation")
+	}
+	if st.nextDelay != convoyCheckBackoffMin {
+		t.Errorf("nextDelay = %v, want %v", st.nextDelay, convoyCheckBackoffMin)
+	}
+	if st.lastTracked != 5 || st.lastReady != 0 {
+		t.Errorf("counts not recorded: tracked=%d ready=%d", st.lastTracked, st.lastReady)
+	}
+}
+
+// TestShouldCheckStuck_RepeatedSameStateBacksOff verifies that an
+// unchanged convoy is gated by exponential backoff on subsequent ticks.
+func TestShouldCheckStuck_RepeatedSameStateBacksOff(t *testing.T) {
+	m := NewConvoyManager(t.TempDir(), func(string, ...interface{}) {}, "gt", 10*time.Minute, nil, nil, nil)
+
+	// First tick: should check, sets nextDelay = 1m.
+	if !m.shouldCheckStuck("hq-cv-stuck", 26, 0) {
+		t.Fatal("first observation should return true")
+	}
+
+	// Immediate second tick: still inside the 1m window → should NOT check.
+	if m.shouldCheckStuck("hq-cv-stuck", 26, 0) {
+		t.Fatal("second observation inside cooldown window should return false")
+	}
+
+	// Fast-forward by manipulating lastCheckedAt back into the past.
+	st := m.checkCooldown["hq-cv-stuck"]
+	st.lastCheckedAt = time.Now().Add(-2 * convoyCheckBackoffMin)
+	if !m.shouldCheckStuck("hq-cv-stuck", 26, 0) {
+		t.Fatal("observation after cooldown should return true")
+	}
+	if st.nextDelay != 2*convoyCheckBackoffMin {
+		t.Errorf("nextDelay should double to %v, got %v", 2*convoyCheckBackoffMin, st.nextDelay)
+	}
+
+	// Drive several more cycles to confirm cap at convoyCheckBackoffMax.
+	for i := 0; i < 10; i++ {
+		st.lastCheckedAt = time.Now().Add(-2 * convoyCheckBackoffMax)
+		m.shouldCheckStuck("hq-cv-stuck", 26, 0)
+	}
+	if st.nextDelay != convoyCheckBackoffMax {
+		t.Errorf("nextDelay should cap at %v, got %v", convoyCheckBackoffMax, st.nextDelay)
+	}
+}
+
+// TestShouldCheckStuck_StateChangeResetsBackoff verifies that a change
+// in tracked/ready counts immediately rechecks the convoy and resets the
+// backoff to the floor (so a newly-feedable convoy isn't held back by
+// stale cooldown).
+func TestShouldCheckStuck_StateChangeResetsBackoff(t *testing.T) {
+	m := NewConvoyManager(t.TempDir(), func(string, ...interface{}) {}, "gt", 10*time.Minute, nil, nil, nil)
+
+	// Establish a long backoff for the convoy.
+	m.shouldCheckStuck("hq-cv-prog", 10, 0)
+	st := m.checkCooldown["hq-cv-prog"]
+	st.nextDelay = convoyCheckBackoffMax
+	st.lastCheckedAt = time.Now() // recent, would normally gate
+
+	// Tracked count drops (one issue closed) → state changed → check now.
+	if !m.shouldCheckStuck("hq-cv-prog", 9, 0) {
+		t.Fatal("state change should bypass cooldown")
+	}
+	if st.nextDelay != convoyCheckBackoffMin {
+		t.Errorf("state change should reset nextDelay to %v, got %v", convoyCheckBackoffMin, st.nextDelay)
+	}
+	if st.lastTracked != 9 {
+		t.Errorf("lastTracked not updated: got %d, want 9", st.lastTracked)
+	}
+}
+
+// TestForceDispatchConvoy_ClearsCooldown verifies the operator escape
+// hatch (hq-mzjyu): clearing the cooldown lets the next scan tick
+// re-check the convoy regardless of how deep the backoff went.
+func TestForceDispatchConvoy_ClearsCooldown(t *testing.T) {
+	m := NewConvoyManager(t.TempDir(), func(string, ...interface{}) {}, "gt", 10*time.Minute, nil, nil, nil)
+
+	// Establish cooldown.
+	m.shouldCheckStuck("hq-cv-stuck", 5, 0)
+	if !m.ForceDispatchConvoy("hq-cv-stuck") {
+		t.Fatal("ForceDispatchConvoy should return true when entry existed")
+	}
+	if _, ok := m.checkCooldown["hq-cv-stuck"]; ok {
+		t.Fatal("cooldown entry should be removed after force-dispatch")
+	}
+	// Next observation acts like a first observation: returns true.
+	if !m.shouldCheckStuck("hq-cv-stuck", 5, 0) {
+		t.Fatal("after force-dispatch, next observation should check immediately")
+	}
+	// Idempotent: clearing an absent entry is a no-op false.
+	if m.ForceDispatchConvoy("hq-cv-nonexistent") {
+		t.Fatal("ForceDispatchConvoy on unknown convoy should return false")
+	}
+}
+
+// TestScanStranded_StuckConvoyBackoff verifies the end-to-end behavior:
+// a stuck convoy gets checked once, then the second scan() inside the
+// cooldown window does NOT re-invoke `gt convoy check`.
+func TestScanStranded_StuckConvoyBackoff(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	// Convoy with tracked issues but none ready (the stuck case).
+	paths := mockGtForScanTest(t, scanTestOpts{
+		strandedJSON: `[{"id":"hq-cv-stuck","title":"Stuck","tracked_count":3,"ready_count":0,"ready_issues":[]}]`,
+	})
+
+	m := NewConvoyManager(paths.townRoot, func(string, ...interface{}) {}, "gt", 10*time.Minute, nil, nil, nil)
+
+	// First scan: convoy check IS invoked.
+	m.scan()
+	checkData, err := os.ReadFile(paths.checkLogPath)
+	if err != nil {
+		t.Fatalf("first scan should have called convoy check: %v", err)
+	}
+	firstContent := string(checkData)
+	if !strings.Contains(firstContent, "hq-cv-stuck") {
+		t.Fatalf("expected first scan to check hq-cv-stuck, got: %q", firstContent)
+	}
+	firstLineCount := strings.Count(firstContent, "hq-cv-stuck")
+
+	// Second scan immediately: cooldown gates, convoy check NOT called again.
+	m.scan()
+	checkData2, err := os.ReadFile(paths.checkLogPath)
+	if err != nil {
+		t.Fatalf("read check log after second scan: %v", err)
+	}
+	secondLineCount := strings.Count(string(checkData2), "hq-cv-stuck")
+	if secondLineCount != firstLineCount {
+		t.Errorf("backoff failed: convoy check called %d times after first scan, %d after second (expected same)",
+			firstLineCount, secondLineCount)
+	}
+
+	// After force-dispatch, the next scan checks again.
+	if !m.ForceDispatchConvoy("hq-cv-stuck") {
+		t.Fatal("force-dispatch should succeed")
+	}
+	m.scan()
+	checkData3, _ := os.ReadFile(paths.checkLogPath)
+	thirdLineCount := strings.Count(string(checkData3), "hq-cv-stuck")
+	if thirdLineCount <= secondLineCount {
+		t.Errorf("after force-dispatch, expected another check; got %d → %d", secondLineCount, thirdLineCount)
+	}
+}
+
+// TestFindStranded_SurfacesEmptyStderrError verifies that when `gt convoy
+// stranded` fails with no stderr output (e.g., binary missing, signal
+// kill), scan() logs a meaningful error rather than the previous
+// "stranded scan failed:" with nothing after the colon (hq-mzjyu).
+func TestFindStranded_SurfacesEmptyStderrError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	// Point gtPath at a path that doesn't exist → exec fails before
+	// stderr is even attached.
+	var logged []string
+	var logMu sync.Mutex
+	logger := func(format string, args ...interface{}) {
+		logMu.Lock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+		logMu.Unlock()
+	}
+
+	m := NewConvoyManager(t.TempDir(), logger, "/nonexistent/gt-binary-hq-mzjyu", 10*time.Minute, nil, nil, nil)
+	m.scan()
+
+	// Find the "stranded scan failed" log line.
+	var failLine string
+	for _, s := range logged {
+		if strings.HasPrefix(s, "Convoy: stranded scan failed:") {
+			failLine = s
+			break
+		}
+	}
+	if failLine == "" {
+		t.Fatalf("expected 'stranded scan failed' log, got: %v", logged)
+	}
+
+	// The reason after the colon must be non-empty AND mention the cause.
+	// We accept anything that names the missing binary or "no such file" /
+	// "fork/exec" / "executable file not found" — any of these is far
+	// better than the previous bare "stranded scan failed:" line.
+	body := strings.TrimSpace(strings.TrimPrefix(failLine, "Convoy: stranded scan failed:"))
+	if body == "" {
+		t.Errorf("error reason is empty after fix: %q", failLine)
+	}
+	lower := strings.ToLower(body)
+	if !strings.Contains(lower, "no such file") &&
+		!strings.Contains(lower, "not found") &&
+		!strings.Contains(lower, "fork/exec") &&
+		!strings.Contains(lower, "nonexistent") &&
+		!strings.Contains(lower, "exit") {
+		t.Errorf("error reason %q doesn't identify the cause", body)
+	}
+}
