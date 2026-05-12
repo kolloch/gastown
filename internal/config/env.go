@@ -181,6 +181,20 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		env["GT_AGENT"] = cfg.Agent
 	}
 
+	// Propagate PATH from the daemon's process env into spawned sessions.
+	// Without this, tmux's `-e KEY=VAL` flags overlay onto a session env that
+	// may not include PATH at all, and the agent's startup wrapper
+	// (`exec env VAR1=v1 ... claude ...`) then fails with status 127 because
+	// `env` can't resolve `claude` on PATH (hq-6y9y8). Likewise, downstream
+	// subprocesses (bd, gt) launched by the agent rely on PATH being set.
+	//
+	// We use os.Getenv("PATH") so the daemon's PATH (augmented at startup by
+	// PATCH-007 to include ~/.local/bin etc.) is what propagates, not a stale
+	// snapshot. Only set if non-empty to avoid clobbering with "".
+	if p := os.Getenv("PATH"); p != "" {
+		env["PATH"] = p
+	}
+
 	// Disable bd's per-repo JSONL auto-backup for all Gas Town agents.
 	// bd auto-enables backup when a git remote exists, then force-adds
 	// .beads/backup/ files (bypassing .gitignore) and commits/pushes them
