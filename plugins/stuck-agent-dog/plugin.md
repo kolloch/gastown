@@ -242,9 +242,26 @@ For DEACON stuck (stale heartbeat):
 3. If agent has been stuck for >15 minutes with no pane activity → restart
 4. If mass death detected (>3 crashes in same cycle) → escalate, don't restart
 
-## Step 5: Take action
+## Step 5: Take action — SERIAL with per-polecat reverification (hq-tu4uf)
 
-For each agent requiring restart:
+**Do NOT batch.** The candidate list from Steps 2-3 is a list of *suspects*,
+not a list of *actions*. Before touching any polecat:
+
+1. Wait `SAD_REVERIFY_DELAY_SEC` seconds (default 5s) to let transient blips
+   resolve (Dolt reconnect, convoy redispatch, nudge in flight).
+2. Re-verify each candidate **independently** via `reverify_polecat`:
+   - Heartbeat file fresh (< `SAD_HEARTBEAT_STALE_SEC` old)? → skip.
+   - Live `claude` process cwd'd to the polecat worktree? → skip.
+   - Hook directory mtime within the settle window? → skip
+     (something already nudged it).
+3. Cap escalations at `SAD_MAX_ESCALATIONS_PER_RUN` (default 1). Even if N
+   polecats are genuinely stuck, only one is acted on per run. The rest
+   are deferred to the next sweep.
+
+This is the code-side enforcement of `feedback_no_bulk_restart_acks.md`:
+"Don't bulk-ack RESTART_POLECAT waves; check polecats one by one."
+
+For each agent requiring restart (after the reverify gate):
 
 ```bash
 # For crashed polecats — notify witness to handle restart
