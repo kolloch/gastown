@@ -59,7 +59,16 @@ func TestDiscoverRigAgents_UsesRigPrefix(t *testing.T) {
 		"bd-hook": {ID: "bd-hook", Title: "Pinned"},
 	}
 
-	agents := discoverRigAgents(map[string]bool{}, r, nil, allAgentBeads, allHookBeads, nil, true)
+	// Mark the witness session as alive so we exercise rig-prefix bead lookup
+	// without triggering the ghost-state self-heal (which rewrites State to
+	// "idle" when Running=false; see reconcileGhostAgentState).
+	// witnessSessionName uses session.PrefixFor(rigName), which falls back to
+	// the default prefix "gt" when no rigs registry is present in the test.
+	allSessions := map[string]bool{
+		witnessSessionName(r.Name): true,
+	}
+
+	agents := discoverRigAgents(allSessions, r, nil, allAgentBeads, allHookBeads, nil, true)
 	if len(agents) != 1 {
 		t.Fatalf("discoverRigAgents() returned %d agents, want 1", len(agents))
 	}
@@ -155,6 +164,93 @@ func TestDiscoverRigAgents_MissingSessionNotRunning(t *testing.T) {
 		}
 	}
 	t.Fatal("witness agent not found in results")
+}
+
+// TestReconcileGhostAgentState_DowngradesWorkingWhenNotRunning verifies that
+// the impossible-by-design combination running=false && state=working is
+// self-healed to state=idle (hq-vxn6i). This is the belt-and-suspenders
+// defense for the ghost-state bug; the authoritative fix is the reaper
+// writing agent_state=idle atomically with the kill.
+func TestReconcileGhostAgentState_DowngradesWorkingWhenNotRunning(t *testing.T) {
+	agent := AgentRuntime{
+		Name:    "nux",
+		Address: "zack/nux",
+		Running: false,
+		State:   string(beads.AgentStateWorking),
+	}
+	stderr := captureStderr(t, func() {
+		reconcileGhostAgentState(&agent)
+	})
+
+	if agent.State != string(beads.AgentStateIdle) {
+		t.Fatalf("ghost state not reconciled: got state=%q, want %q", agent.State, beads.AgentStateIdle)
+	}
+	if !strings.Contains(stderr, "ghost agent state") {
+		t.Fatalf("expected warning log, got: %q", stderr)
+	}
+	if !strings.Contains(stderr, "zack/nux") {
+		t.Fatalf("expected agent address in warning, got: %q", stderr)
+	}
+}
+
+// TestReconcileGhostAgentState_DowngradesAllActiveStates verifies that all
+// "active" agent states (working, running, spawning, patrolling) are
+// downgraded when the session is not running. Non-active states (idle, done,
+// stuck, awaiting-gate) must be left alone — they represent intentional
+// non-running conditions that are legitimately recorded in beads.
+func TestReconcileGhostAgentState_DowngradesAllActiveStates(t *testing.T) {
+	activeStates := []beads.AgentState{
+		beads.AgentStateWorking,
+		beads.AgentStateRunning,
+		beads.AgentStateSpawning,
+		beads.AgentStatePatrolling,
+	}
+	for _, st := range activeStates {
+		st := st
+		t.Run(string(st), func(t *testing.T) {
+			agent := AgentRuntime{Running: false, State: string(st)}
+			_ = captureStderr(t, func() { reconcileGhostAgentState(&agent) })
+			if agent.State != string(beads.AgentStateIdle) {
+				t.Fatalf("active state %q not downgraded: got %q", st, agent.State)
+			}
+		})
+	}
+}
+
+// TestReconcileGhostAgentState_PreservesNonActiveStates verifies that
+// non-active agent states (stuck, awaiting-gate, idle, done, paused) are NOT
+// modified — those are observable-by-design states that legitimately appear
+// while Running=false.
+func TestReconcileGhostAgentState_PreservesNonActiveStates(t *testing.T) {
+	preservedStates := []beads.AgentState{
+		beads.AgentStateIdle,
+		beads.AgentStateDone,
+		beads.AgentStateStuck,
+		beads.AgentStateAwaitingGate,
+		beads.AgentStatePaused,
+		beads.AgentStateNuked,
+	}
+	for _, st := range preservedStates {
+		st := st
+		t.Run(string(st), func(t *testing.T) {
+			agent := AgentRuntime{Running: false, State: string(st)}
+			_ = captureStderr(t, func() { reconcileGhostAgentState(&agent) })
+			if agent.State != string(st) {
+				t.Fatalf("non-active state %q was mutated to %q", st, agent.State)
+			}
+		})
+	}
+}
+
+// TestReconcileGhostAgentState_LeavesRunningAgentAlone verifies that an agent
+// whose tmux session IS running keeps its state unchanged, regardless of what
+// state the bead claims.
+func TestReconcileGhostAgentState_LeavesRunningAgentAlone(t *testing.T) {
+	agent := AgentRuntime{Running: true, State: string(beads.AgentStateWorking)}
+	_ = captureStderr(t, func() { reconcileGhostAgentState(&agent) })
+	if agent.State != string(beads.AgentStateWorking) {
+		t.Fatalf("running agent state was modified: got %q, want %q", agent.State, beads.AgentStateWorking)
+	}
 }
 
 func TestBuildStatusIndicator_ZombieShowsStopped(t *testing.T) {

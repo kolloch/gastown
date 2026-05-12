@@ -2961,6 +2961,14 @@ func (d *Daemon) killIdlePolecat(rigName, polecatName, sessionName string, idleD
 	// Clean up heartbeat file
 	polecat.RemoveSessionHeartbeat(d.config.TownRoot, sessionName)
 
+	// Reset the agent bead's state to "idle" in the same logical operation as the kill.
+	// Without this, the bead retains state="working" while the session is dead,
+	// producing the impossible-by-design "running=false && state=working" combination
+	// (hq-vxn6i). Downstream consumers (stuck-agent-dog, gt status) then classify the
+	// ghost as stuck and may auto-nuke it on respawn, triggering a self-perpetuating
+	// mass-death loop. Resetting state here is the atomic counterpart to the kill.
+	d.resetAgentStateAfterReap(rigName, polecatName, reason)
+
 	d.logger.Printf("Reaped idle polecat %s/%s — session killed, API slot freed", rigName, polecatName)
 
 	// Emit feed event so the activity feed shows the reap
@@ -2968,6 +2976,36 @@ func (d *Daemon) killIdlePolecat(rigName, polecatName, sessionName string, idleD
 		events.SessionDeathPayload(sessionName, fmt.Sprintf("%s/polecats/%s", rigName, polecatName),
 			fmt.Sprintf("idle-reap: %s, idle %v (threshold %v)", reason, idleDuration.Truncate(time.Second), timeout),
 			"daemon"))
+}
+
+// resetAgentStateAfterReap writes agent_state="idle" on the polecat's agent bead
+// after the reaper kills its session. This prevents the ghost-state combination
+// (running=false && state=working) that triggers downstream auto-nuke behavior
+// in stuck-agent-dog (hq-vxn6i).
+//
+// Agent beads are routed to the town's .beads database regardless of rig prefix,
+// so we pin BEADS_DIR to townRoot/.beads — matching the contract used by
+// getAgentBeadInfo. Errors are logged but non-fatal: the kill has already
+// succeeded; the state-coherence patrol in gt status provides a defense-in-depth
+// self-heal.
+func (d *Daemon) resetAgentStateAfterReap(rigName, polecatName, reason string) {
+	prefix := beads.GetPrefixForRig(d.config.TownRoot, rigName)
+	agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
+
+	townBeadsDir := filepath.Join(d.config.TownRoot, ".beads")
+	bd := beads.NewWithBeadsDir(d.config.TownRoot, townBeadsDir).ForAgentBead()
+
+	idleState := string(beads.AgentStateIdle)
+	emptyHook := ""
+	if err := bd.UpdateAgentDescriptionFields(agentBeadID, beads.AgentFieldUpdates{
+		AgentState: &idleState,
+		HookBead:   &emptyHook,
+	}); err != nil {
+		d.logger.Printf("Warning: failed to reset agent_state=idle for %s/%s after reap (reason=%s): %v",
+			rigName, polecatName, reason, err)
+		return
+	}
+	d.logger.Printf("Reset agent_state=idle for %s/%s after reap (reason=%s)", rigName, polecatName, reason)
 }
 
 // cleanupOrphanedProcesses kills orphaned claude subagent processes.

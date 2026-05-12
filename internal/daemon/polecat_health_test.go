@@ -626,3 +626,155 @@ func TestReapIdlePolecat_ReapsIdleNoHook(t *testing.T) {
 		t.Errorf("expected working-no-hook reason, got: %q", got)
 	}
 }
+
+// writeFakeBDRecording creates a "bd" mock that records every invocation to a
+// log file and returns an agent-bead JSON for `show`. Used to verify that the
+// reaper performs an `update` (or in-process state reset) following a kill.
+// The script also responds to `version` and `list` so the wider beads/bd
+// machinery (NewWithBeadsDir → UpdateAgentDescriptionFields → bd update) works
+// during the test.
+func writeFakeBDRecording(t *testing.T, dir, logPath, descState string) string {
+	t.Helper()
+	desc := "role_type: polecat\\nrig: myr\\nagent_state: " + descState + "\\nhook_bead: gt-xyz"
+	bdJSON := fmt.Sprintf(`[{"id":"gt-myr-polecat-mycat","title":"Polecat mycat","issue_type":"agent","labels":["gt:agent"],"description":"%s","hook_bead":"gt-xyz","agent_state":"%s","updated_at":"%s"}]`,
+		desc, descState, time.Now().UTC().Format(time.RFC3339))
+	// Walk the argv looking for the first non-flag arg — bd is invoked with
+	// global flags (--allow-stale, --repo, ...) before the subcommand. Echo all
+	// args so the test can assert on the full invocation history.
+	script := fmt.Sprintf(`#!/bin/sh
+echo "$@" >> %s
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) cmd="$arg"; break ;;
+  esac
+done
+case "$cmd" in
+  version) exit 0 ;;
+  show) printf '%%s' '%s' ;;
+  list) echo '[]' ;;
+  update) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, logPath, bdJSON)
+	path := filepath.Join(dir, "bd")
+	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		t.Fatalf("writing recording bd: %v", err)
+	}
+	return path
+}
+
+// TestReapIdlePolecat_ResetsAgentStateAfterKill verifies that when the reaper
+// kills a polecat session, it also resets the agent bead's agent_state to
+// "idle". Without this, the bead retains state="working" while the session is
+// dead, producing the impossible ghost combination (running=false &&
+// state=working) that triggered the mass-death loop (hq-vxn6i).
+func TestReapIdlePolecat_ResetsAgentStateAfterKill(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for tmux and bd")
+	}
+	old := session.DefaultRegistry()
+	reg := session.NewPrefixRegistry()
+	reg.Register("myr", "myr")
+	session.SetDefaultRegistry(reg)
+	defer session.SetDefaultRegistry(old)
+
+	binDir := t.TempDir()
+	writeFakeTmuxIdleSession(t, binDir)
+	bdLog := filepath.Join(t.TempDir(), "bd-calls.log")
+	bdPath := writeFakeBDRecording(t, binDir, bdLog, "working")
+
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	townRoot := t.TempDir()
+	// Ensure the town .beads directory exists so beads.NewWithBeadsDir is happy.
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir town .beads: %v", err)
+	}
+	var logBuf strings.Builder
+	d := &Daemon{
+		config: &Config{TownRoot: townRoot},
+		logger: log.New(&logBuf, "", 0),
+		tmux:   tmux.NewTmuxWithSocket(""),
+		bdPath: bdPath,
+	}
+
+	// Drive the reaper directly via killIdlePolecat — the upstream eligibility
+	// path is exercised by the other tests in this file.
+	sessionName := session.PolecatSessionName(session.PrefixFor("myr"), "mycat")
+	d.killIdlePolecat("myr", "mycat", sessionName, 20*time.Minute, 15*time.Minute, "working-no-hook")
+
+	got := logBuf.String()
+	if !strings.Contains(got, "Reset agent_state=idle") {
+		t.Errorf("expected log line confirming agent_state=idle reset after reap, got: %q", got)
+	}
+
+	// Cross-check: bd should have been invoked with `update` to write
+	// the new description back. The exact invocation comes from
+	// UpdateAgentDescriptionFields; we just confirm an update call landed.
+	data, err := os.ReadFile(bdLog)
+	if err != nil {
+		t.Fatalf("read bd invocation log: %v", err)
+	}
+	if !strings.Contains(string(data), "update gt-myr-polecat-mycat") {
+		t.Errorf("expected bd update for agent bead, got invocations:\n%s", string(data))
+	}
+}
+
+// TestReapIdlePolecat_RespawnAfterReapStartsClean is a sequencing test: it
+// confirms that after the reaper kills a polecat AND writes agent_state=idle,
+// a subsequent observer that only inspects the bead state (without consulting
+// tmux) sees "idle" — not the carried-over "working". This is what was
+// failing in production: the reaper left state="working", the polecat got
+// respawned, and stuck-agent-dog saw state="working" with no recent activity
+// and nuked it. After the fix, the bead transitions through idle on reap.
+func TestReapIdlePolecat_RespawnAfterReapStartsClean(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for tmux and bd")
+	}
+	old := session.DefaultRegistry()
+	reg := session.NewPrefixRegistry()
+	reg.Register("myr", "myr")
+	session.SetDefaultRegistry(reg)
+	defer session.SetDefaultRegistry(old)
+
+	binDir := t.TempDir()
+	writeFakeTmuxIdleSession(t, binDir)
+	bdLog := filepath.Join(t.TempDir(), "bd-calls.log")
+	bdPath := writeFakeBDRecording(t, binDir, bdLog, "working")
+
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir town .beads: %v", err)
+	}
+	var logBuf strings.Builder
+	d := &Daemon{
+		config: &Config{TownRoot: townRoot},
+		logger: log.New(&logBuf, "", 0),
+		tmux:   tmux.NewTmuxWithSocket(""),
+		bdPath: bdPath,
+	}
+
+	sessionName := session.PolecatSessionName(session.PrefixFor("myr"), "mycat")
+	d.killIdlePolecat("myr", "mycat", sessionName, 30*time.Minute, 15*time.Minute, "working-no-hook")
+
+	// Verify the bd update invocation carried the idle state in its arguments.
+	// UpdateAgentDescriptionFields rewrites the description; the new description
+	// must contain "agent_state: idle". The fake bd records all argv lines.
+	data, err := os.ReadFile(bdLog)
+	if err != nil {
+		t.Fatalf("read bd invocation log: %v", err)
+	}
+	calls := string(data)
+	// An "update" line must be present and the new description blob must encode
+	// agent_state: idle. The bd CLI receives --description with the rendered text.
+	if !strings.Contains(calls, "update") {
+		t.Fatalf("no bd update call recorded after reap; calls:\n%s", calls)
+	}
+	if !strings.Contains(calls, "agent_state: idle") {
+		t.Errorf("bd update did not carry agent_state=idle (got carry-over working?); calls:\n%s", calls)
+	}
+}
