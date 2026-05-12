@@ -45,6 +45,13 @@ type Heartbeat struct {
 }
 
 // HeartbeatFile returns the path to the Deacon heartbeat file.
+//
+// AUTHORITATIVE SOURCE for deacon liveness. The daemon's stuck-detector
+// (checkDeaconHeartbeat) reads this file and ONLY this file. A sibling
+// `deacon/state.json` carries a `last_patrol` field that the deacon's
+// patrol prompt updates — that file is NOT authoritative for liveness
+// because it can stall for unrelated reasons (stranded convoy, gate
+// cooldown, etc.) while the deacon is heartbeating normally. See hq-iju6g.
 func HeartbeatFile(townRoot string) string {
 	return filepath.Join(townRoot, "deacon", "heartbeat.json")
 }
