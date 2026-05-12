@@ -1663,6 +1663,11 @@ func discoverGlobalAgents(townRoot string, allSessions map[string]bool, allAgent
 				}
 			}
 
+			// State-coherence self-heal: catch ghost-state combos left over by
+			// reaper paths that killed the session without resetting the bead.
+			// hq-vxn6i: prevents stuck-agent-dog from misclassifying the agent.
+			reconcileGhostAgentState(&agent)
+
 			// Get mail info (skip if --fast)
 			if !skipMail {
 				populateMailInfo(&agent, mailRouter)
@@ -1674,6 +1679,40 @@ func discoverGlobalAgents(townRoot string, allSessions map[string]bool, allAgent
 
 	wg.Wait()
 	return agents
+}
+
+// reconcileGhostAgentState detects and self-heals the impossible-by-design
+// combination `Running=false && State=<active>` (hq-vxn6i). This combination
+// arises when the reaper kills a polecat's session but the agent bead retains
+// its prior `agent_state=working` (or other active value) — typically because
+// a reaper code path forgot to update the bead atomically with the kill.
+//
+// When detected, the in-memory State is downgraded to "idle" and a one-line
+// warning is logged so the underlying upstream writer can be debugged. We do
+// not write back to the bead from this read path: this is a status read, and
+// writes here would surprise other readers and racing writers (e.g. gt sling).
+// The reaper (and the polecat self-managed completion paths) own the
+// persistent transition. This patrol is belt-and-suspenders.
+//
+// "Active" states are those that imply the agent should currently be running:
+// working, running, spawning, patrolling. Stuck/awaiting-gate/paused/idle/done
+// are intentionally non-running and are not downgraded.
+func reconcileGhostAgentState(agent *AgentRuntime) {
+	if agent.Running {
+		return
+	}
+	state := beads.AgentState(agent.State)
+	if !state.IsActive() {
+		return
+	}
+	addr := agent.Address
+	if addr == "" {
+		addr = agent.Name
+	}
+	fmt.Fprintf(os.Stderr,
+		"warning: ghost agent state detected (%s): running=false state=%s — downgrading to idle (hq-vxn6i)\n",
+		addr, agent.State)
+	agent.State = string(beads.AgentStateIdle)
 }
 
 // populateMailInfo fetches unread mail count and first subject for an agent
@@ -1837,6 +1876,11 @@ func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, 
 					agent.NotificationLevel = fields.NotificationLevel
 				}
 			}
+
+			// State-coherence self-heal: catch ghost-state combos left over by
+			// reaper paths that killed the session without resetting the bead.
+			// hq-vxn6i: prevents stuck-agent-dog from misclassifying the polecat.
+			reconcileGhostAgentState(&agent)
 
 			// Get mail info (skip if --fast)
 			if !skipMail {
