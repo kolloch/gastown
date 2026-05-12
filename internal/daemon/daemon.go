@@ -1438,6 +1438,15 @@ func (d *Daemon) deaconGracePeriod() time.Duration {
 // This is a belt-and-suspenders fallback in case Boot doesn't detect stuck states.
 // Uses the heartbeat file that the Deacon updates on each patrol cycle.
 //
+// AUTHORITATIVE SOURCE: <town_root>/deacon/heartbeat.json (written by
+// `gt deacon heartbeat` via deacon.Touch / deacon.TouchWithAction). The
+// daemon must read ONLY this file when judging Deacon liveness. There is a
+// sibling file <town_root>/deacon/state.json with a `last_patrol` field
+// written by the deacon's patrol prompt — it is NOT a heartbeat source
+// (it can stall for reasons unrelated to deacon health, e.g. a stranded
+// mol-deacon-patrol convoy). Reading state.json here would produce
+// false-positive escalations. See hq-iju6g. (#bug)
+//
 // PATCH-005: Fixed grace period logic. Old logic skipped heartbeat check entirely
 // during grace period, allowing stuck Deacons to go undetected. New logic:
 // - Always read heartbeat first
