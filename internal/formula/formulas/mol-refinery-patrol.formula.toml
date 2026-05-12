@@ -71,6 +71,9 @@ source of truth.
 | review_timeout_seconds | 300 | Per-reviewer timeout. Timed-out reviewer = PASS with timeout NIT. |
 | merge_strategy | direct | Merge strategy: 'direct' (ff-only merge+push) or 'pr' (GitHub PR) |
 | require_review | false | Require at least one approving GitHub review before merging (pr mode only) |
+| post_merge_ci_monitor_enabled | true | Whether to monitor GitHub Actions on the merge commit and escalate on failure |
+| post_merge_ci_timeout | 1800 | Timeout (seconds) to wait for post-merge CI to reach a terminal state |
+| post_merge_ci_poll_interval | 30 | Interval (seconds) between `gh run list` polls while waiting on post-merge CI |
 
 ## Target Resolution Rule
 
@@ -100,6 +103,7 @@ Abbreviated patrol rules:
 - **inbox-check**: Run `gt mail drain` and quick inbox check. Skip individual message processing unless new MERGE_READY found.
 - **queue-scan**: Quick `gt mq list` check. If queue is empty, skip directly to check-integration-branches.
 - **process-branch through merge-push**: Only run if queue-scan found work. Otherwise SKIP all.
+- **monitor-post-merge-ci**: SKIP if no merges were processed (no commit to monitor).
 - **loop-check through generate-summary**: SKIP if no merges were processed.
 - **reconcile-prs**: Always run (cheap safety net for externally-merged PRs).
 - **check-integration-branches**: Quick check only.
@@ -111,7 +115,7 @@ When `await-event` outputs `EFFORT: full`, run all steps thoroughly (normal mode
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-refinery-patrol"
-version = 15
+version = 16
 
 [vars]
 [vars.wisp_type]
@@ -189,6 +193,18 @@ default = "direct"
 [vars.require_review]
 description = "Require at least one approving GitHub review before merging (only applies when merge_strategy=pr)."
 default = "false"
+
+[vars.post_merge_ci_monitor_enabled]
+description = "Whether to monitor GitHub Actions on the merge commit and escalate on failure. Set to 'false' for projects without GitHub Actions or when CI monitoring is undesirable."
+default = "true"
+
+[vars.post_merge_ci_timeout]
+description = "Maximum time in seconds to wait for post-merge CI to reach a terminal state. Pending runs past this window are logged but do NOT trigger an escalation (they may be legitimately long-running)."
+default = "1800"
+
+[vars.post_merge_ci_poll_interval]
+description = "Interval in seconds between `gh run list` polls while waiting on post-merge CI to complete."
+default = "30"
 
 [vars.rig]
 description = "Name of the rig this refinery belongs to (e.g., gastown, laser)"
@@ -1043,14 +1059,227 @@ If you skipped notifications or archiving, GO BACK AND DO THEM NOW.
 Target branch has moved. Any remaining branches need rebasing on new baseline."""
 
 [[steps]]
+id = "monitor-post-merge-ci"
+title = "Monitor post-merge CI and escalate on failure"
+needs = ["merge-push"]
+description = """
+**Config: post_merge_ci_monitor_enabled = {{post_merge_ci_monitor_enabled}}**
+**Config: post_merge_ci_timeout = {{post_merge_ci_timeout}}**
+**Config: post_merge_ci_poll_interval = {{post_merge_ci_poll_interval}}**
+
+After a successful merge-push, watch GitHub Actions on the resulting merge commit.
+If any workflow run fails within the timeout window, escalate to mayor via
+`gt escalate -s HIGH` with enough context to file a fix bead.
+
+**Skip conditions:**
+
+- If `post_merge_ci_monitor_enabled` is not "true": skip this step entirely.
+  Log: "Post-merge CI monitor disabled" and proceed to loop-check.
+- If merge-push did not actually merge anything this cycle (no merge commit,
+  e.g. the MR was rejected, conflicted, or skipped): skip this step.
+  Log: "No merge this cycle, nothing to monitor" and proceed to loop-check.
+- If `gh` is not authenticated for the repo: log a single warning bead and
+  proceed (do NOT escalate — auth is a refinery setup issue, not a CI failure).
+
+**Goal**: Maintain green-state on the merged-to branch without overseer having to
+surface failures manually. Refinery does NOT auto-revert or auto-retry; that
+remains a human decision.
+
+## Step 1: Capture the merge commit SHA
+
+Use the SHA that was actually pushed in merge-push (Step 1.5 captured `LOCAL_SHA`
+post-push verification). If you did not retain it, recover it:
+
+```bash
+git fetch origin
+MERGE_SHA=$(git rev-parse origin/<merge-target>)
+echo "Monitoring CI for commit: $MERGE_SHA"
+```
+
+Track this SHA alongside the merged branch name and bead ID for the
+generate-summary step.
+
+## Step 2: Determine the GitHub repo slug
+
+```bash
+REPO_SLUG=$(git remote get-url origin | sed -E 's#(git@github.com:|https?://github.com/)##; s#\\.git$##')
+echo "Repo: $REPO_SLUG"
+```
+
+If the origin is not a github.com remote, log "Not a GitHub remote, skipping
+CI monitor" and proceed to loop-check. This keeps the step a no-op for rigs
+hosted elsewhere.
+
+## Step 3: Poll GitHub Actions runs for this SHA
+
+Poll until all runs reach a terminal state, or the timeout elapses.
+
+Terminal `status` values: `completed`. Terminal `conclusion` values: `success`,
+`failure`, `cancelled`, `timed_out`, `action_required`, `neutral`, `skipped`,
+`startup_failure`. A run with `status=in_progress` or `status=queued` is still
+pending.
+
+```bash
+START=$(date +%s)
+TIMEOUT={{post_merge_ci_timeout}}
+INTERVAL={{post_merge_ci_poll_interval}}
+
+while true; do
+  RUNS_JSON=$(gh run list --repo "$REPO_SLUG" --commit "$MERGE_SHA" \\
+    --limit 50 --json databaseId,name,status,conclusion,url,workflowName,event)
+
+  # Treat empty array as "no runs registered yet" — GH may take a few seconds
+  # after push before Actions register the workflow.
+  COUNT=$(echo "$RUNS_JSON" | jq 'length')
+  PENDING=$(echo "$RUNS_JSON" | jq '[.[] | select(.status != "completed")] | length')
+  FAILED=$(echo "$RUNS_JSON" | jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure")] | length')
+
+  echo "ci-monitor: commit=$MERGE_SHA runs=$COUNT pending=$PENDING failed=$FAILED elapsed=$(( $(date +%s) - START ))s"
+
+  # All runs terminal → exit loop
+  if [ "$COUNT" -gt 0 ] && [ "$PENDING" -eq 0 ]; then
+    break
+  fi
+
+  # Timeout reached → exit loop (PENDING runs remain, treated as inconclusive)
+  ELAPSED=$(( $(date +%s) - START ))
+  if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+    echo "ci-monitor: timeout reached with $PENDING run(s) still pending"
+    break
+  fi
+
+  sleep "$INTERVAL"
+done
+```
+
+Notes:
+- The 50-run limit is generous; typical commits have <10 workflows. Increase if
+  a rig has many workflows on a single commit.
+- `gh run list --commit <sha>` returns runs whose `head_sha` matches the merge
+  commit, which is exactly what we want for direct-merge mode and for
+  squash/merge commits in PR mode.
+
+## Step 4: Aggregate conclusions
+
+After the poll loop exits, classify the final `$RUNS_JSON`:
+
+```bash
+# All-success path
+ALL_SUCCESS=$(echo "$RUNS_JSON" | jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length')
+# Failures
+FAILURES=$(echo "$RUNS_JSON" | jq -c '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure")]')
+FAIL_COUNT=$(echo "$FAILURES" | jq 'length')
+# Still pending (only possible on timeout)
+STILL_PENDING=$(echo "$RUNS_JSON" | jq -c '[.[] | select(.status != "completed")]')
+STILL_PENDING_COUNT=$(echo "$STILL_PENDING" | jq 'length')
+```
+
+Decision matrix:
+
+| FAIL_COUNT | STILL_PENDING_COUNT | Action |
+|------------|---------------------|--------|
+| 0 | 0 | SUCCESS — log summary entry, proceed silently |
+| 0 | >0 | TIMEOUT — log "<N> run(s) still pending past timeout, NOT escalating" and proceed |
+| >0 | any | FAILURE — escalate (Step 5) |
+
+Cancelled-only runs (no failures, no pending, only `cancelled` / `skipped` /
+`neutral`) are treated as success for the purposes of this step. Refinery does
+not second-guess a deliberate cancel.
+
+## Step 5: Escalate on failure
+
+For each failing run, gather context and emit a single escalation. If multiple
+runs failed on the same commit, prefer one consolidated escalation over N
+separate ones.
+
+```bash
+# Pick the first failure for the primary detail, mention the rest by name
+PRIMARY=$(echo "$FAILURES" | jq -r '.[0]')
+PRIMARY_ID=$(echo "$PRIMARY" | jq -r '.databaseId')
+PRIMARY_NAME=$(echo "$PRIMARY" | jq -r '.workflowName // .name')
+PRIMARY_URL=$(echo "$PRIMARY" | jq -r '.url')
+PRIMARY_CONCLUSION=$(echo "$PRIMARY" | jq -r '.conclusion')
+OTHER_NAMES=$(echo "$FAILURES" | jq -r '.[1:] | map(.workflowName // .name) | join(", ")')
+
+# Pull last ~50 lines of the failing job's log. `--log-failed` filters to only
+# failed steps and is much smaller than `--log`.
+LOG_TAIL=$(gh run view "$PRIMARY_ID" --repo "$REPO_SLUG" --log-failed 2>/dev/null | tail -50 || echo "(log unavailable)")
+
+BODY=$(cat <<EOF
+Post-merge CI failure on <merge-target>.
+
+Commit: $MERGE_SHA
+Branch: <merge-target>
+Merged-branch: <polecat-branch>
+Bead: <issue-id>
+Failing workflow: $PRIMARY_NAME ($PRIMARY_CONCLUSION)
+Run URL: $PRIMARY_URL
+Other failing workflows: ${OTHER_NAMES:-(none)}
+Total failed: $FAIL_COUNT
+Still pending: $STILL_PENDING_COUNT
+
+## Last failing-step log (tail)
+~~~
+$LOG_TAIL
+~~~
+
+## Suggested next steps
+- Review the run at $PRIMARY_URL
+- If the failure looks like a real regression: file a fix bead and assign
+  the polecat (or open a hotpatch task)
+- If it looks flaky/transient: rerun via 'gh run rerun $PRIMARY_ID --repo $REPO_SLUG'
+- Refinery does NOT auto-revert or auto-retry — this is your call.
+EOF
+)
+
+gt escalate -s HIGH \\
+  "ci-red: $PRIMARY_NAME failed on <merge-target> @ ${MERGE_SHA:0:7}" \\
+  -m "$BODY"
+```
+
+## Step 6: Track for generate-summary
+
+Record in this cycle's tracking state (consumed by `generate-summary`):
+
+- `ci_monitor_commits`: list of (commit, branch, bead-id, result) tuples
+  where result is one of `success`, `failure`, `timeout`, `skipped`.
+- `ci_monitor_escalations`: count of escalations sent.
+- `ci_monitor_failed_workflows`: per-commit list of failed workflow names.
+
+Include a one-line entry per merged commit in the summary regardless of
+outcome — green is worth recording because absence of an entry would be
+ambiguous (was monitoring disabled? Did it run?).
+
+## Failure-mode handling for the monitor itself
+
+If any of the `gh` calls fail (rate limit, network, auth), do NOT escalate
+a false CI failure. Instead:
+
+```bash
+gt nudge mayor "ci-monitor degraded: gh call failed for $MERGE_SHA (see refinery log)"
+```
+
+…and proceed to loop-check. A failed monitor is an operational issue, not a
+CI red.
+
+## Out of scope (do NOT do here)
+
+- Auto-revert (refinery never reverts)
+- Auto-retry of flaky jobs (you may *suggest* `gh run rerun` in the escalation
+  body, but do not execute it)
+- Failure-pattern matching across multiple merges (a separate analyzer job
+  may eventually consume the escalation beads)
+- Reacting to the mayor's response (out of scope; mayor decides what to do)"""
+
+[[steps]]
 id = "loop-check"
 title = "Check for more work"
-needs = ["merge-push"]
+needs = ["monitor-post-merge-ci"]
 description = """
 More branches to process?
 
 **Entry paths:**
-- Normal: After successful merge-push
+- Normal: After successful merge-push (and post-merge CI monitor)
 - Conflict-skip: After process-branch created conflict-resolution task
 
 If yes: Return to process-branch with next branch.
@@ -1060,6 +1289,7 @@ If no: Continue to generate-summary.
 - branches_merged: count and names of successfully merged branches
 - branches_conflict: count and names of branches skipped due to conflicts
 - conflict_tasks: IDs of conflict-resolution tasks created
+- ci_monitor_results: per-merged-commit CI outcomes from monitor-post-merge-ci
 
 This tracking feeds into generate-summary for the patrol digest."""
 
@@ -1122,6 +1352,8 @@ Include in summary:
 - Conflict-resolution tasks created (IDs)
 - Issues filed (if any)
 - Any escalations sent
+- Post-merge CI results per merged commit (success / failure / timeout / skipped)
+- CI-monitor escalations sent (count, with run URLs)
 
 **Conflict tracking is important** for monitoring MQ health. If many branches
 conflict, it may indicate target branches are moving too fast or branches are too stale.
@@ -1435,6 +1667,7 @@ After await-event returns, check the EFFORT directive in the output:
 - inbox-check: Quick drain + check for MERGE_READY only
 - queue-scan: Quick `gt mq list`. If empty, skip to check-integration-branches
 - process-branch through merge-push: SKIP if queue empty
+- monitor-post-merge-ci: SKIP if no merges processed
 - loop-check through generate-summary: SKIP if no merges processed
 - check-integration-branches: Quick check only
 - context-check: One-sentence self-assessment
