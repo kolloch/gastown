@@ -30,6 +30,23 @@ const (
 	// auto-close. This prevents a race where the daemon's stranded scan
 	// fires before the sling's bd dep add is visible in Dolt. See GH#2303.
 	convoyGracePeriod = 5 * time.Minute
+
+	// Per-convoy completion-check backoff bounds (hq-mzjyu).
+	//
+	// When a convoy reports "N tracked, 0 ready" we run `gt convoy check`
+	// to auto-close completed convoys. This is a Dolt-heavy operation. If
+	// the convoy state hasn't changed since the previous check (same
+	// tracked/ready counts), repeating the call every scan tick is wasted
+	// work that contributes to Dolt load and obscures real progress in the
+	// daemon log.
+	//
+	// We apply exponential backoff to the per-convoy completion check
+	// only — not to feeding ready issues, and not to closing empty convoys
+	// outside the grace period. The backoff resets when:
+	//   (a) the convoy's tracked or ready counts change (real progress), or
+	//   (b) operator runs `gt convoy force-dispatch <id>` (manual reset).
+	convoyCheckBackoffMin = 1 * time.Minute
+	convoyCheckBackoffMax = 8 * time.Minute
 )
 
 // strandedConvoyInfo matches the JSON output of `gt convoy stranded --json`.
@@ -112,6 +129,34 @@ type ConvoyManager struct {
 	// been handled. This allows the 1s overlap window above without replaying
 	// the same lifecycle events on every poll.
 	processedLifecycleEvents sync.Map // map[string]bool
+
+	// checkCooldown tracks per-convoy backoff for the "tracked but 0 ready"
+	// completion-check path (hq-mzjyu). The entry is created/updated whenever
+	// scan() decides whether to call `gt convoy check` for a stranded-but-stuck
+	// convoy. State changes (tracked/ready count delta) reset the backoff.
+	// Protected by checkCooldownMu so reads from forceDispatch don't race
+	// with writer in scan().
+	checkCooldownMu sync.Mutex
+	checkCooldown   map[string]*convoyCheckState
+}
+
+// convoyCheckState is the per-convoy cooldown record for the
+// "tracked but 0 ready" completion-check path.
+type convoyCheckState struct {
+	// lastCheckedAt is the wall time of the most recent `gt convoy check`
+	// call this manager made for this convoy via the stuck path.
+	lastCheckedAt time.Time
+
+	// nextDelay is the delay required before the next check. It grows
+	// exponentially (×2) up to convoyCheckBackoffMax while state is
+	// unchanged, and resets to convoyCheckBackoffMin when state changes.
+	nextDelay time.Duration
+
+	// lastTracked / lastReady are the convoy counts from the most recent
+	// observation. A change in either is treated as "real progress" and
+	// resets the backoff so a freshly-feedable convoy is rechecked promptly.
+	lastTracked int
+	lastReady   int
 }
 
 // NewConvoyManager creates a new convoy manager.
@@ -131,15 +176,16 @@ func NewConvoyManager(townRoot string, logger func(format string, args ...interf
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &ConvoyManager{
-		townRoot:     townRoot,
-		scanInterval: scanInterval,
-		ctx:          ctx,
-		cancel:       cancel,
-		logger:       logger,
-		stores:       stores,
-		openStores:   openStores,
-		isRigParked:  isRigParked,
-		gtPath:       gtPath,
+		townRoot:      townRoot,
+		scanInterval:  scanInterval,
+		ctx:           ctx,
+		cancel:        cancel,
+		logger:        logger,
+		stores:        stores,
+		openStores:    openStores,
+		isRigParked:   isRigParked,
+		gtPath:        gtPath,
+		checkCooldown: make(map[string]*convoyCheckState),
 	}
 }
 
@@ -500,6 +546,15 @@ func (m *ConvoyManager) scan() {
 			// (a) all tracked issues are closed → convoy should auto-close
 			// (b) issues are blocked/in-progress → needs agent review
 			// Run convoy check to handle case (a); it's a no-op for (b).
+			//
+			// Apply per-convoy exponential backoff (hq-mzjyu): without it,
+			// a long-running stuck convoy (e.g. mol-deacon-patrol with 26
+			// in-flight issues) gets re-checked every 30s indefinitely,
+			// hammering Dolt and burying real events in the daemon log.
+			// Backoff resets when tracked/ready counts change.
+			if !m.shouldCheckStuck(c.ID, c.TrackedCount, c.ReadyCount) {
+				continue
+			}
 			m.logger("Convoy %s: %d tracked issues, 0 ready — checking completion", c.ID, c.TrackedCount)
 			m.checkConvoyCompletion(c.ID)
 		}
@@ -507,6 +562,13 @@ func (m *ConvoyManager) scan() {
 }
 
 // findStranded runs `gt convoy stranded --json` and parses the output.
+//
+// When the subprocess fails, we surface the actual reason (hq-mzjyu): some
+// failure modes — context cancellation, signal kills, missing gt binary —
+// produce an empty stderr, which previously logged as the useless line
+// "Convoy: stranded scan failed:" with nothing after the colon. We now
+// fall back to the error from cmd.Run() and the first line of stdout so
+// future debugging has at least one identifiable string to grep on.
 func (m *ConvoyManager) findStranded() ([]strandedConvoyInfo, error) {
 	cmd := exec.CommandContext(m.ctx, m.gtPath, "convoy", "stranded", "--json")
 	cmd.Dir = m.townRoot
@@ -517,7 +579,21 @@ func (m *ConvoyManager) findStranded() ([]strandedConvoyInfo, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("%s", util.FirstLine(stderr.String()))
+		msg := util.FirstLine(stderr.String())
+		if msg == "" {
+			msg = util.FirstLine(stdout.String())
+		}
+		if msg == "" {
+			// No output at all — surface the os/exec error itself (e.g.,
+			// "context canceled", "signal: killed", "exit status 1",
+			// "fork/exec /path/to/gt: no such file or directory").
+			msg = err.Error()
+		} else {
+			// Prefix with the underlying error so callers see both the
+			// process exit reason and the program's own diagnostic.
+			msg = fmt.Sprintf("%s: %s", err.Error(), msg)
+		}
+		return nil, fmt.Errorf("%s", msg)
 	}
 
 	var stranded []strandedConvoyInfo
@@ -528,6 +604,87 @@ func (m *ConvoyManager) findStranded() ([]strandedConvoyInfo, error) {
 	}
 
 	return stranded, nil
+}
+
+// shouldCheckStuck reports whether scan() should call `gt convoy check`
+// for a stuck convoy (tracked issues > 0, ready issues == 0) on this tick.
+//
+// Returns true if either:
+//   - we have no prior record for this convoy (first observation), or
+//   - the convoy's tracked/ready counts changed since last check (real
+//     progress — reset backoff and check immediately), or
+//   - enough time has passed since the last check (current backoff window).
+//
+// Returns false (and updates no state) when we're still inside the
+// current backoff window.
+//
+// On a "true" return, state is updated: lastCheckedAt advances to now,
+// counts are recorded, and nextDelay either resets (state changed) or
+// doubles (still stuck), capped at convoyCheckBackoffMax.
+//
+// See hq-mzjyu — without this gate, mol-deacon-patrol's workflow convoy
+// gets re-checked every 30s indefinitely.
+func (m *ConvoyManager) shouldCheckStuck(convoyID string, tracked, ready int) bool {
+	m.checkCooldownMu.Lock()
+	defer m.checkCooldownMu.Unlock()
+
+	now := time.Now()
+	st, ok := m.checkCooldown[convoyID]
+	if !ok {
+		m.checkCooldown[convoyID] = &convoyCheckState{
+			lastCheckedAt: now,
+			nextDelay:     convoyCheckBackoffMin,
+			lastTracked:   tracked,
+			lastReady:     ready,
+		}
+		return true
+	}
+
+	stateChanged := st.lastTracked != tracked || st.lastReady != ready
+	if stateChanged {
+		// Real progress — log it and reset backoff so the next stuck
+		// observation starts from the floor.
+		m.logger("Convoy %s: state changed (tracked %d→%d, ready %d→%d) — resetting check backoff",
+			convoyID, st.lastTracked, tracked, st.lastReady, ready)
+		st.lastTracked = tracked
+		st.lastReady = ready
+		st.lastCheckedAt = now
+		st.nextDelay = convoyCheckBackoffMin
+		return true
+	}
+
+	if now.Sub(st.lastCheckedAt) < st.nextDelay {
+		return false
+	}
+
+	// Still stuck, but the cooldown has elapsed. Run a check and double
+	// the next delay (bounded). The convoy auto-closes if all tracked
+	// issues are closed; otherwise this is effectively a no-op and we
+	// wait even longer next time.
+	st.lastCheckedAt = now
+	next := st.nextDelay * 2
+	if next > convoyCheckBackoffMax {
+		next = convoyCheckBackoffMax
+	}
+	st.nextDelay = next
+	return true
+}
+
+// ForceDispatchConvoy clears the per-convoy completion-check cooldown so
+// the next scan tick rechecks the convoy immediately, bypassing the
+// exponential backoff. Returns true if there was a cooldown to clear.
+//
+// This is the runtime hook for the `gt convoy force-dispatch <id>` CLI
+// (hq-mzjyu). The CLI invokes it via the daemon socket; tests call it
+// directly. Idempotent — clearing an absent entry is a no-op.
+func (m *ConvoyManager) ForceDispatchConvoy(convoyID string) bool {
+	m.checkCooldownMu.Lock()
+	defer m.checkCooldownMu.Unlock()
+	if _, ok := m.checkCooldown[convoyID]; !ok {
+		return false
+	}
+	delete(m.checkCooldown, convoyID)
+	return true
 }
 
 // feedFirstReady iterates through all ready issues in a stranded convoy and
