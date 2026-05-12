@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
@@ -25,6 +27,11 @@ var (
 	mqSubmitNoCleanup bool
 	mqSubmitSkipDeps  bool
 	mqSubmitResubmit  bool
+
+	// Reconcile-prs flags
+	mqReconcilePRsSinceHours int
+	mqReconcilePRsLimit      int
+	mqReconcilePRsJSON       bool
 
 	// Retry flags
 	mqRetryNow bool
@@ -188,6 +195,40 @@ Examples:
 	RunE: runMQPostMerge,
 }
 
+var mqReconcilePRsCmd = &cobra.Command{
+	Use:   "reconcile-prs <rig>",
+	Short: "Close beads referenced by recently-merged PRs that slipped past auto-close",
+	Long: `Scan recently-merged PRs on the rig's default branch and close any
+referenced beads that are still open.
+
+This is the safety net for the auto-close-on-PR mechanism (hq-k6oai).
+The primary close path runs inside the refinery merge pipeline (via
+Engineer.HandleMRInfoSuccess) and only fires when refinery merges the
+PR itself. If a PR is merged externally — for example a refinery hotpatch
+branch merged by a human on github.com, or a contributor PR landed
+manually — the source bead stays OPEN until something reconciles it.
+This command is that something.
+
+For each merged PR in the lookback window, the reconciler:
+  1. Extracts bead IDs from the PR title, body, and head_ref_name.
+  2. For each ID still open in beads, force-closes it with a reason
+     referencing the PR.
+  3. Logs successful closes and nudges mayor (because every successful
+     reconcile means the primary close path missed — that signal is
+     useful for spotting patterns).
+  4. Logs failures and nudges mayor with severity context.
+
+Designed to be run on every refinery patrol cycle. Idempotent — already
+closed beads are no-ops.
+
+Examples:
+  gt mq reconcile-prs gastown                  # default lookback (24h)
+  gt mq reconcile-prs zack --since-hours 72    # widen lookback for catch-up
+  gt mq reconcile-prs gastown --json           # machine-readable report`,
+	Args: cobra.ExactArgs(1),
+	RunE: runMQReconcilePRs,
+}
+
 var mqStatusCmd = &cobra.Command{
 	Use:   "status <id>",
 	Short: "Show detailed merge request status",
@@ -335,6 +376,11 @@ func init() {
 	// Post-merge flags
 	mqPostMergeCmd.Flags().BoolVar(&mqPostMergeSkipBranchDelete, "skip-branch-delete", false, "Skip remote branch deletion")
 
+	// Reconcile-prs flags
+	mqReconcilePRsCmd.Flags().IntVar(&mqReconcilePRsSinceHours, "since-hours", 24, "Only consider PRs merged within the last N hours")
+	mqReconcilePRsCmd.Flags().IntVar(&mqReconcilePRsLimit, "limit", 50, "Max number of recent merged PRs to scan")
+	mqReconcilePRsCmd.Flags().BoolVar(&mqReconcilePRsJSON, "json", false, "Emit machine-readable JSON report")
+
 	// Add subcommands
 	mqCmd.AddCommand(mqSubmitCmd)
 	mqCmd.AddCommand(mqRetryCmd)
@@ -342,6 +388,7 @@ func init() {
 	mqCmd.AddCommand(mqRejectCmd)
 	mqCmd.AddCommand(mqStatusCmd)
 	mqCmd.AddCommand(mqPostMergeCmd)
+	mqCmd.AddCommand(mqReconcilePRsCmd)
 
 	// Integration branch subcommands
 	mqIntegrationCreateCmd.Flags().StringVar(&mqIntegrationCreateBranch, "branch", "", "Override branch name template (supports {title}, {epic}, {prefix}, {user})")
@@ -581,4 +628,83 @@ func runMQPostMerge(_ *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func runMQReconcilePRs(cmd *cobra.Command, args []string) error {
+	rigName := args[0]
+	mgr, _, _, err := getRefineryManager(rigName)
+	if err != nil {
+		return err
+	}
+
+	since := time.Time{}
+	if mqReconcilePRsSinceHours > 0 {
+		since = time.Now().Add(-time.Duration(mqReconcilePRsSinceHours) * time.Hour)
+	}
+
+	result, err := mgr.ReconcileMergedPRs(cmd.Context(), since, mqReconcilePRsLimit)
+	if err != nil {
+		return fmt.Errorf("reconcile PRs: %w", err)
+	}
+
+	if mqReconcilePRsJSON {
+		return emitReconcilePRsJSON(result)
+	}
+
+	fmt.Printf("%s Reconciled merged PRs on rig=%s (lookback %dh, scanned=%d)\n",
+		style.Bold.Render("✓"), rigName, mqReconcilePRsSinceHours, result.PRsScanned)
+	for _, c := range result.Closed {
+		fmt.Printf("  %s closed bead %s via PR #%d  (%s)\n",
+			style.Success.Render("✓"), c.BeadID, c.PRNumber, truncateForDisplay(c.PRTitle, 60))
+	}
+	if result.AlreadyClosed > 0 {
+		fmt.Printf("  %s %d bead reference(s) already closed (steady-state)\n",
+			style.Dim.Render("○"), result.AlreadyClosed)
+	}
+	for _, f := range result.Failures {
+		fmt.Printf("  %s bead %s (PR #%d): %v\n",
+			style.Bold.Render("!"), f.BeadID, f.PRNumber, f.Err)
+	}
+	if len(result.Failures) > 0 {
+		// Make CI / patrol scripts notice.
+		return fmt.Errorf("reconcile-prs: %d close failure(s)", len(result.Failures))
+	}
+	return nil
+}
+
+func emitReconcilePRsJSON(r *refinery.ReconcileResult) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(struct {
+		PRsScanned    int                          `json:"prs_scanned"`
+		Closed        []refinery.ReconcileClosed   `json:"closed"`
+		AlreadyClosed int                          `json:"already_closed"`
+		Failures      []reconcilePRsFailureWire    `json:"failures"`
+	}{
+		PRsScanned:    r.PRsScanned,
+		Closed:        r.Closed,
+		AlreadyClosed: r.AlreadyClosed,
+		Failures:      toWireFailures(r.Failures),
+	})
+}
+
+type reconcilePRsFailureWire struct {
+	BeadID   string `json:"bead_id"`
+	PRNumber int    `json:"pr_number"`
+	Err      string `json:"error"`
+}
+
+func toWireFailures(fs []refinery.ReconcileFailure) []reconcilePRsFailureWire {
+	out := make([]reconcilePRsFailureWire, len(fs))
+	for i, f := range fs {
+		out[i] = reconcilePRsFailureWire{BeadID: f.BeadID, PRNumber: f.PRNumber, Err: f.Err.Error()}
+	}
+	return out
+}
+
+func truncateForDisplay(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return strings.TrimSpace(s[:max]) + "…"
 }

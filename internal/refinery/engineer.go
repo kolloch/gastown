@@ -1231,7 +1231,16 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 			if issue, showErr := e.beads.Show(mr.SourceIssue); showErr == nil && beads.IssueStatus(issue.Status).IsTerminal() {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Source issue already closed: %s\n", mr.SourceIssue)
 			} else {
-				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close source issue %s: %v\n", mr.SourceIssue, err)
+				// hq-k6oai: this is the primary auto-close-on-PR failure
+				// site. Log loudly AND nudge mayor so silent gaps surface
+				// without waiting for a status audit. The reconciler
+				// (gt mq reconcile-prs) is a backstop, not a substitute
+				// for fixing whatever made this fail.
+				_, _ = fmt.Fprintf(e.output, "[Engineer] WARNING: auto-close-on-PR failed for source issue %s: %v\n", mr.SourceIssue, err)
+				notifyMayor(e.workDir, fmt.Sprintf(
+					"AUTO_CLOSE_FAILED: rig=%s mr=%s bead=%s err=%v — bead stayed open; consider gt mq reconcile-prs %s",
+					e.rig.Name, mr.ID, mr.SourceIssue, err, e.rig.Name,
+				))
 			}
 		} else {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Closed source issue: %s\n", mr.SourceIssue)
