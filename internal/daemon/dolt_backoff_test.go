@@ -591,7 +591,9 @@ func TestWriteAndClearUnhealthySignal(t *testing.T) {
 	}
 
 	// Write signal
-	m.writeUnhealthySignal("server_dead", "PID 12345 is dead")
+	if first := m.writeUnhealthySignal("server_dead", "PID 12345 is dead"); !first {
+		t.Fatal("expected first unhealthy signal write to report a new incident")
+	}
 
 	if _, err := os.Stat(m.unhealthySignalFile()); err != nil {
 		t.Error("expected unhealthy signal after write")
@@ -605,6 +607,17 @@ func TestWriteAndClearUnhealthySignal(t *testing.T) {
 	content := string(data)
 	if content == "" {
 		t.Error("signal file should not be empty")
+	}
+
+	if second := m.writeUnhealthySignal("read_only", "duplicate incident"); second {
+		t.Fatal("expected duplicate unhealthy signal write to be suppressed")
+	}
+	data, err = os.ReadFile(m.unhealthySignalFile())
+	if err != nil {
+		t.Fatalf("failed to read signal file after duplicate write: %v", err)
+	}
+	if string(data) != content {
+		t.Fatalf("duplicate write changed signal file: got %q, want %q", string(data), content)
 	}
 
 	// Clear signal
@@ -1232,6 +1245,39 @@ func TestEnsureRunning_ReadOnlyWritesUnhealthySignal(t *testing.T) {
 	content := string(data)
 	if !strings.Contains(content, "read_only") {
 		t.Errorf("expected 'read_only' reason in signal file, got: %s", content)
+	}
+}
+
+func TestEnsureRunning_SuppressesDuplicateUnhealthyAlerts(t *testing.T) {
+	var running atomic.Bool
+	var alertCount atomic.Int32
+	running.Store(true)
+
+	m := newTestManager(t)
+	m.runningFn = func() (int, bool) {
+		if running.Load() {
+			return 1234, true
+		}
+		return 0, false
+	}
+	m.healthCheckFn = func() error { return fmt.Errorf("connection refused") }
+	m.stopFn = func() { running.Store(false) }
+	m.startFn = func() error {
+		running.Store(true)
+		return nil
+	}
+	m.unhealthyAlertFn = func(error) { alertCount.Add(1) }
+	m.sleepFn = func(d time.Duration) {}
+
+	if err := m.EnsureRunning(); err != nil {
+		t.Fatalf("first EnsureRunning: %v", err)
+	}
+	if err := m.EnsureRunning(); err != nil {
+		t.Fatalf("second EnsureRunning: %v", err)
+	}
+
+	if got := alertCount.Load(); got != 1 {
+		t.Fatalf("unhealthy alert count = %d, want 1", got)
 	}
 }
 

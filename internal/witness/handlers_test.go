@@ -1849,6 +1849,32 @@ func TestZombieAgentSelfReportedStuck_Classification(t *testing.T) {
 	}
 }
 
+func TestZombieNeverHeartbeated_Classification(t *testing.T) {
+	t.Parallel()
+	if ZombieNeverHeartbeated != "never-heartbeated" {
+		t.Errorf("ZombieNeverHeartbeated = %q, want %q", ZombieNeverHeartbeated, "never-heartbeated")
+	}
+	if !ZombieNeverHeartbeated.ImpliesActiveWork() {
+		t.Error("ZombieNeverHeartbeated should imply active work")
+	}
+
+	// Session old enough (>5m default) with assigned work and no heartbeat → flag.
+	oldSession := time.Now().Add(-10 * time.Minute)
+	shouldFlag := time.Since(oldSession) > config.DefaultWitnessHeartbeatStartupGrace
+	if !shouldFlag {
+		t.Errorf("expected flag for session age=%v, threshold=%v",
+			time.Since(oldSession).Round(time.Second), config.DefaultWitnessHeartbeatStartupGrace)
+	}
+
+	// Session within grace period → no flag.
+	newSession := time.Now().Add(-2 * time.Minute)
+	shouldNotFlag := time.Since(newSession) <= config.DefaultWitnessHeartbeatStartupGrace
+	if !shouldNotFlag {
+		t.Errorf("expected no flag for session age=%v, threshold=%v",
+			time.Since(newSession).Round(time.Second), config.DefaultWitnessHeartbeatStartupGrace)
+	}
+}
+
 func TestNotifyRefineryMergeReady_EmitsChannelEvent(t *testing.T) {
 	// Create a fake town root with the workspace marker so workspace.Find recognizes it
 	townRoot := t.TempDir()

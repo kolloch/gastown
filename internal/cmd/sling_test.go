@@ -1659,13 +1659,17 @@ func TestCheckCrossRigGuard(t *testing.T) {
 			wantErr:     true,
 		},
 		{
-			name:        "town-level: hq bead to rig (rejected — belongs to town root)",
+			// Known town-root prefix: warn but allow. A crew member with a broken
+			// redirect chain may create hq-* beads that legitimately target a rig
+			// polecat (gt-gbu). Hard-rejecting silently drops all their polecat work.
+			name:        "town-level: hq bead to rig (warns but allows — gt-gbu)",
 			beadID:      "hq-abc123",
 			targetAgent: "gastown/polecats/Toast",
-			wantErr:     true,
+			wantErr:     false,
 		},
 		{
-			name:        "unknown prefix: rejected (no route maps to target rig)",
+			// Truly unknown prefix (not in routes.jsonl): hard reject.
+			name:        "unknown prefix: rejected (no route exists at all)",
 			beadID:      "xx-unknown",
 			targetAgent: "gastown/polecats/Toast",
 			wantErr:     true,
@@ -1686,8 +1690,8 @@ func TestCheckCrossRigGuard(t *testing.T) {
 			}
 			if err != nil && tc.wantErr {
 				errMsg := err.Error()
-				if !strings.Contains(errMsg, "cross-rig mismatch") && !strings.Contains(errMsg, "town root") {
-					t.Errorf("expected cross-rig or town-root error, got: %v", err)
+				if !strings.Contains(errMsg, "cross-rig mismatch") && !strings.Contains(errMsg, "not in routes") {
+					t.Errorf("expected cross-rig mismatch or unknown-prefix error, got: %v", err)
 				}
 				if !strings.Contains(errMsg, "--force") {
 					t.Errorf("error should mention --force override, got: %v", err)

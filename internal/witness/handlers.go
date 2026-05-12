@@ -1074,6 +1074,12 @@ const (
 	ZombieSessionDeadActive ZombieClassification = "session-dead-active"
 	// ZombieAgentSelfReportedStuck: agent self-reported stuck via heartbeat v2 (gt-3vr5).
 	ZombieAgentSelfReportedStuck ZombieClassification = "agent-self-reported-stuck"
+
+	// ZombieNeverHeartbeated: live session with assigned work but no heartbeat file
+	// written — agent likely stuck at startup (e.g., auth 401 blocking initialization).
+	// Detected once the session exceeds the HeartbeatStartupGrace threshold.
+	// Flagged for formula-step review; no auto-action (auth errors don't self-heal). (gt-uk7)
+	ZombieNeverHeartbeated ZombieClassification = "never-heartbeated"
 )
 
 // ImpliesActiveWork returns true if this classification indicates the polecat
@@ -1083,7 +1089,8 @@ const (
 func (c ZombieClassification) ImpliesActiveWork() bool {
 	switch c {
 	case ZombieStuckInDone, ZombieAgentDeadInSession, ZombieBeadClosedStillRunning,
-		ZombieDoneIntentDead, ZombieSessionDeadActive, ZombieAgentSelfReportedStuck:
+		ZombieDoneIntentDead, ZombieSessionDeadActive, ZombieAgentSelfReportedStuck,
+		ZombieNeverHeartbeated:
 		return true
 	default:
 		return false
@@ -1254,7 +1261,8 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 	// Heartbeat v2 check (gt-3vr5): if the agent reports its own state via heartbeat,
 	// trust the agent-reported state instead of inferring from timers.
 	// The witness makes exactly ONE inference: is the heartbeat fresh?
-	if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil && hb.IsV2() {
+	hb := polecat.ReadSessionHeartbeat(townRoot, sessionName)
+	if hb != nil && hb.IsV2() {
 		stale := time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold
 		if !stale {
 			switch hb.EffectiveState() {
@@ -1353,6 +1361,26 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 			zombie.Action = fmt.Sprintf("restart-bead-closed-failed: %v", err)
 		}
 		return zombie, true
+	}
+
+	// Live session with assigned work but no heartbeat file: agent stuck at startup
+	// (e.g., auth 401 blocking initialization). Once the session is old enough to
+	// have written a first heartbeat and hasn't, flag for formula-step review.
+	// ZFC (gt-uk7): No auto-restart — auth errors don't self-heal on restart.
+	if snapHook != "" && hb == nil {
+		if createdAt, err := t.GetSessionCreatedTime(sessionName); err == nil {
+			age := time.Since(createdAt)
+			if age > witCfg.HeartbeatStartupGraceD() {
+				return ZombieResult{
+					PolecatName:    polecatName,
+					AgentState:     snapState,
+					Classification: ZombieNeverHeartbeated,
+					HookBead:       snapHook,
+					WasActive:      true,
+					Action:         fmt.Sprintf("flagged-for-review (no heartbeat, session-age=%v)", age.Round(time.Second)),
+				}, true
+			}
+		}
 	}
 
 	return ZombieResult{}, false

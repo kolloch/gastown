@@ -155,6 +155,20 @@ var idleWatcherPollInterval = 1 * time.Second
 // For "queue" mode: writes to the nudge queue for cooperative delivery.
 // For "wait-idle" mode: waits for idle, then delivers or falls back to queue.
 func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
+	// Test hook: when GT_TEST_NUDGE_LOG is set, log the nudge instead of
+	// delivering through real tmux/queue transport. Prevents test-suite
+	// runs from delivering "test" messages to live agents (mayor reported
+	// recurring synthetic nudges traced to nudge_test.go invocations).
+	// Mirrors the pattern in sling_helpers.go's nudgeWitness/nudgeRefinery.
+	if logPath := os.Getenv("GT_TEST_NUDGE_LOG"); logPath != "" {
+		entry := fmt.Sprintf("nudge:%s:%s:%s\n", sessionName, sender, message)
+		if f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			_, _ = f.WriteString(entry)
+			_ = f.Close()
+		}
+		return nil
+	}
+
 	townRoot, _ := workspace.FindFromCwd()
 
 	// Use the requested mode, but force queue mode for ACP sessions.

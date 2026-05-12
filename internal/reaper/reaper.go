@@ -155,6 +155,10 @@ const (
 	DefaultQueryTimeout = 30 * time.Second
 	// DefaultBatchSize is the number of rows per batch DELETE operation.
 	DefaultBatchSize = 100
+	// DefaultAlertThreshold is the open-wisp count above which callers should
+	// surface a warning. Sized above the natural steady-state for the current
+	// dog/deacon emit rate (~23 wisps/h × 24h TTL ≈ 550). See hq-57jr8.
+	DefaultAlertThreshold = 800
 )
 
 // ValidateDBName returns an error if the database name is unsafe.

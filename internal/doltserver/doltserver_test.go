@@ -125,6 +125,50 @@ func TestGetDoltFlagFromArgs(t *testing.T) {
 	}
 }
 
+func TestReadSQLServerInfo(t *testing.T) {
+	dataDir := t.TempDir()
+	infoDir := filepath.Join(dataDir, ".dolt")
+	if err := os.MkdirAll(infoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	infoPath := filepath.Join(infoDir, "sql-server.info")
+	if err := os.WriteFile(infoPath, []byte("62569:3307:757ce4ea-40c5-40f1-9eaf-4d584cae87b0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := readSQLServerInfo(&Config{DataDir: dataDir})
+	if err != nil {
+		t.Fatalf("readSQLServerInfo: %v", err)
+	}
+	if info.PID != 62569 {
+		t.Fatalf("PID = %d, want 62569", info.PID)
+	}
+	if info.Port != 3307 {
+		t.Fatalf("Port = %d, want 3307", info.Port)
+	}
+	if info.ServerID != "757ce4ea-40c5-40f1-9eaf-4d584cae87b0" {
+		t.Fatalf("ServerID = %q", info.ServerID)
+	}
+	if info.Path != infoPath {
+		t.Fatalf("Path = %q, want %q", info.Path, infoPath)
+	}
+}
+
+func TestReadSQLServerInfoRejectsMalformedContent(t *testing.T) {
+	dataDir := t.TempDir()
+	infoDir := filepath.Join(dataDir, ".dolt")
+	if err := os.MkdirAll(infoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(infoDir, "sql-server.info"), []byte("not-a-pid:3307"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := readSQLServerInfo(&Config{DataDir: dataDir}); err == nil {
+		t.Fatal("expected malformed sql-server.info to fail")
+	}
+}
+
 func TestDoltProcessMatchesTownPaths(t *testing.T) {
 	expectedDir := "/town/.dolt-data"
 

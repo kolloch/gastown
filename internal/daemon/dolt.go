@@ -9,11 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/doltserver"
@@ -428,9 +426,11 @@ func (m *DoltServerManager) EnsureRunning() error {
 		m.lastCheck = m.now()
 		if err := m.checkHealthLocked(); err != nil {
 			m.logger("Dolt server unhealthy: %v, restarting...", err)
-			m.sendUnhealthyAlert(err)
-			m.writeUnhealthySignal("health_check_failed", err.Error())
-			m.captureGoroutineDump()
+			if m.writeUnhealthySignal("health_check_failed", err.Error()) {
+				m.sendUnhealthyAlert(err)
+			} else {
+				m.logger("Dolt incident already active; suppressing duplicate unhealthy alert")
+			}
 			m.stopLocked()
 			return m.restartWithBackoff()
 		}
@@ -440,9 +440,11 @@ func (m *DoltServerManager) EnsureRunning() error {
 		// state that requires a server restart to clear.
 		if err := m.checkWriteHealthLocked(); err != nil {
 			m.logger("Dolt server read-only: %v, restarting...", err)
-			m.sendReadOnlyAlert(err)
-			m.writeUnhealthySignal("read_only", err.Error())
-			m.captureGoroutineDump()
+			if m.writeUnhealthySignal("read_only", err.Error()) {
+				m.sendReadOnlyAlert(err)
+			} else {
+				m.logger("Dolt incident already active; suppressing duplicate read-only alert")
+			}
 			m.stopLocked()
 			return m.restartWithBackoff()
 		}
@@ -454,9 +456,11 @@ func (m *DoltServerManager) EnsureRunning() error {
 			m.lastIdentityCheck = now
 			if err := m.checkDatabaseIdentityLocked(); err != nil {
 				m.logger("Dolt server identity check failed: %v, restarting...", err)
-				m.sendUnhealthyAlert(fmt.Errorf("identity check: %w", err))
-				m.writeUnhealthySignal("imposter_detected", err.Error())
-				m.captureGoroutineDump()
+				if m.writeUnhealthySignal("imposter_detected", err.Error()) {
+					m.sendUnhealthyAlert(fmt.Errorf("identity check: %w", err))
+				} else {
+					m.logger("Dolt incident already active; suppressing duplicate identity alert")
+				}
 				m.stopLocked()
 				// Also kill any imposters before restarting
 				if killErr := doltserver.KillImposters(m.townRoot); killErr != nil {
@@ -476,8 +480,11 @@ func (m *DoltServerManager) EnsureRunning() error {
 	// Not running, start it
 	if pid > 0 {
 		m.logger("Dolt server PID %d is dead, cleaning up and restarting...", pid)
-		m.sendCrashAlert(pid)
-		m.writeUnhealthySignal("server_dead", fmt.Sprintf("PID %d is dead", pid))
+		if m.writeUnhealthySignal("server_dead", fmt.Sprintf("PID %d is dead", pid)) {
+			m.sendCrashAlert(pid)
+		} else {
+			m.logger("Dolt incident already active; suppressing duplicate crash alert")
+		}
 	}
 	return m.restartWithBackoff()
 }
@@ -769,12 +776,33 @@ func (m *DoltServerManager) unhealthySignalFile() string {
 
 // writeUnhealthySignal writes the DOLT_UNHEALTHY signal file.
 // This file signals to witness patrols that the Dolt server is degraded.
-func (m *DoltServerManager) writeUnhealthySignal(reason, detail string) {
+// It returns true only for the first write in an active incident. Existing
+// signal files are preserved so repeated health ticks do not reset the
+// incident timestamp or re-trigger diagnostics.
+func (m *DoltServerManager) writeUnhealthySignal(reason, detail string) bool {
+	signalFile := m.unhealthySignalFile()
 	payload := fmt.Sprintf(`{"reason":%q,"detail":%q,"timestamp":%q}`,
-		reason, detail, time.Now().UTC().Format(time.RFC3339))
-	if err := os.WriteFile(m.unhealthySignalFile(), []byte(payload), 0644); err != nil {
-		m.logger("Warning: failed to write DOLT_UNHEALTHY signal: %v", err)
+		reason, detail, m.now().UTC().Format(time.RFC3339))
+	f, err := os.OpenFile(signalFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if os.IsExist(err) {
+		return false
 	}
+	if err != nil {
+		m.logger("Warning: failed to write DOLT_UNHEALTHY signal: %v", err)
+		return true
+	}
+	if _, err := f.WriteString(payload); err != nil {
+		_ = f.Close()
+		_ = os.Remove(signalFile)
+		m.logger("Warning: failed to write DOLT_UNHEALTHY signal: %v", err)
+		return true
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(signalFile)
+		m.logger("Warning: failed to write DOLT_UNHEALTHY signal: %v", err)
+		return true
+	}
+	return true
 }
 
 // clearUnhealthySignal removes the DOLT_UNHEALTHY signal file when the server is healthy.
@@ -824,8 +852,8 @@ data_dir: %q
 behavior:
   dolt_transaction_commit: false
   auto_gc_behavior:
-    enable: true
-    archive_level: 1
+    enable: false
+    archive_level: 0
 `,
 		cfg.Port,
 		hostLine,
@@ -941,33 +969,6 @@ func (m *DoltServerManager) Stop() error {
 }
 
 // stopLocked stops the Dolt server. Must be called with m.mu held.
-// captureGoroutineDump sends SIGQUIT to the Dolt server to dump goroutine stacks
-// to its log file. Per Tim Sehn (Dolt CEO): kill -QUIT prints all goroutine stacks
-// to stderr, which is redirected to the server log. Called before stopping an
-// unhealthy server so the dump captures what it was stuck on.
-func (m *DoltServerManager) captureGoroutineDump() {
-	pid, running := m.isRunning()
-	if !running {
-		return
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return
-	}
-	m.logger("Capturing goroutine dump from Dolt server (PID %d) before restart...", pid)
-	if runtime.GOOS == "windows" {
-		m.logger("Goroutine dump via SIGQUIT not supported on Windows, skipping")
-		return
-	}
-	if err := process.Signal(syscall.SIGQUIT); err != nil {
-		m.logger("Warning: failed to send SIGQUIT for goroutine dump: %v", err)
-		return
-	}
-	// Give the server a moment to write the dump to its log file.
-	time.Sleep(500 * time.Millisecond)
-	m.logger("Goroutine dump written to server log. View with: gt dolt logs -n 200")
-}
-
 func (m *DoltServerManager) stopLocked() {
 	if m.stopFn != nil {
 		m.stopFn()

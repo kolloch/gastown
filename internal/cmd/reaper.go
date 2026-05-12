@@ -228,8 +228,9 @@ Returns the count of reaped wisps. Use --dry-run to preview.`,
 				}
 				fmt.Printf("\n%sReap summary (%d databases): reaped %d wisps, %d open remain\n",
 					prefix, len(results), totalReaped, totalOpen)
-				if totalOpen > 500 {
-					fmt.Fprintf(os.Stderr, "WARNING: %d open wisps exceed alert threshold (500)\n", totalOpen)
+				if totalOpen > reaper.DefaultAlertThreshold {
+					fmt.Fprintf(os.Stderr, "WARNING: %d open wisps exceed alert threshold (%d)\n",
+						totalOpen, reaper.DefaultAlertThreshold)
 				}
 			}
 		}

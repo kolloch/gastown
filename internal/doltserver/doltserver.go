@@ -47,10 +47,10 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gofrs/flock"
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/style"
-	"github.com/steveyegge/gastown/internal/atomicfile"
 	"gopkg.in/yaml.v3"
 )
 
@@ -163,6 +163,17 @@ const (
 	// in gh-3623 and is far longer than any healthy bd query takes.
 	// Override with GT_DOLT_WAIT_TIMEOUT.
 	DefaultWaitTimeoutSec = 30
+
+	// DefaultTimeZone is the MySQL `time_zone` server variable, set after
+	// startup. UTC keeps server-side `NOW()`/`CURRENT_TIMESTAMP` consistent
+	// with Go-side `time.Now().UTC()` writes. Without this, columns populated
+	// by SQL (e.g. `closed_at = NOW()` in reaper.go) and columns populated
+	// by Go drivers disagree by the host TZ offset, breaking age comparisons
+	// in ad-hoc queries. The reaper itself binds Go-side UTC values so its
+	// math is unaffected, but humans triaging via `dolt sql` get misled.
+	// See hq-57jr8.
+	// Override with GT_DOLT_TIME_ZONE; set to empty to skip the override.
+	DefaultTimeZone = "+00:00"
 )
 
 // doltConfigYAML represents the subset of Dolt's config.yaml that we need to read.
@@ -255,6 +266,12 @@ type Config struct {
 	// Set to 0 to skip the override and let Dolt use its 8-hour default.
 	WaitTimeoutSec int
 
+	// TimeZone is the MySQL `time_zone` server variable, set via
+	// `SET GLOBAL time_zone = '...'` after the server is reachable. Empty
+	// string skips the override and lets Dolt inherit the host TZ.
+	// See hq-57jr8 and DefaultTimeZone.
+	TimeZone string
+
 	// LogLevel is the Dolt server log level (trace, debug, info, warning, error, fatal).
 	// Default is "warning" to suppress connection open/close noise. Override with
 	// GT_DOLT_LOGLEVEL=info (or debug) for diagnostics.
@@ -289,6 +306,7 @@ func DefaultConfig(townRoot string) *Config {
 		ReadTimeoutMs:  DefaultReadTimeoutMs,
 		WriteTimeoutMs: DefaultWriteTimeoutMs,
 		WaitTimeoutSec: DefaultWaitTimeoutSec,
+		TimeZone:       DefaultTimeZone,
 		LogLevel:       "warning",
 	}
 
@@ -302,6 +320,12 @@ func DefaultConfig(townRoot string) *Config {
 				config.WaitTimeoutSec = n
 			}
 		}
+	}
+
+	// Optional override for the server timezone. Empty value disables the
+	// post-start `SET GLOBAL time_zone` and lets Dolt inherit the host TZ.
+	if v, ok := os.LookupEnv("GT_DOLT_TIME_ZONE"); ok {
+		config.TimeZone = v
 	}
 
 	if h := os.Getenv("GT_DOLT_HOST"); h != "" {
@@ -505,9 +529,60 @@ type State struct {
 	Databases []string `json:"databases,omitempty"`
 }
 
+// SQLServerInfo is Dolt's own runtime metadata from .dolt/sql-server.info.
+type SQLServerInfo struct {
+	PID      int
+	Port     int
+	ServerID string
+	Path     string
+}
+
 // StateFile returns the path to the state file.
 func StateFile(townRoot string) string {
 	return filepath.Join(townRoot, "daemon", "dolt-state.json")
+}
+
+func sqlServerInfoPath(config *Config) string {
+	return filepath.Join(config.DataDir, ".dolt", "sql-server.info")
+}
+
+// SQLServerInfoPath returns the Dolt-managed sql-server.info path for a town.
+func SQLServerInfoPath(townRoot string) string {
+	return sqlServerInfoPath(DefaultConfig(townRoot))
+}
+
+// ReadSQLServerInfo reads Dolt's own sql-server.info metadata for a town.
+func ReadSQLServerInfo(townRoot string) (*SQLServerInfo, error) {
+	return readSQLServerInfo(DefaultConfig(townRoot))
+}
+
+func readSQLServerInfo(config *Config) (*SQLServerInfo, error) {
+	path := sqlServerInfoPath(config)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(data)), ":", 3)
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("malformed sql-server.info at %s", path)
+	}
+	pid, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("malformed sql-server.info PID at %s: %w", path, err)
+	}
+	port, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("malformed sql-server.info port at %s: %w", path, err)
+	}
+	info := &SQLServerInfo{
+		PID:  pid,
+		Port: port,
+		Path: path,
+	}
+	if len(parts) > 2 {
+		info.ServerID = parts[2]
+	}
+	return info, nil
 }
 
 // LoadState loads Dolt server state from disk.
@@ -580,6 +655,15 @@ func IsRunning(townRoot string) (bool, int, error) {
 		}
 		_ = conn.Close()
 		return true, 0, nil
+	}
+
+	// Prefer Dolt's own runtime metadata when present. During daemon restarts,
+	// daemon/dolt-state.json and daemon/dolt.pid can lag behind the live
+	// sql-server process, but .dolt/sql-server.info is written by Dolt itself.
+	if info, err := readSQLServerInfo(config); err == nil && info.Port == config.Port && info.PID > 0 {
+		if processIsAlive(info.PID) && isDoltServerOnPort(config.Port) && doltProcessMatchesTown(townRoot, info.PID, config) {
+			return true, info.PID, nil
+		}
 	}
 
 	// First check PID file
@@ -1257,6 +1341,21 @@ func CheckPortAvailable(port int) error {
 // without it, returns PID only (ZFC fix: gt-utuk).
 func PortHolder(port int) (pid int, dataDir string) {
 	pid = findDoltServerOnPort(port)
+	if pid <= 0 {
+		return 0, ""
+	}
+	if dataDir = GetDoltDataDirFromProcess(pid); dataDir != "" {
+		return pid, dataDir
+	}
+	if configPath := getDoltConfigPathFromProcess(pid); configPath != "" {
+		if filepath.Base(configPath) == "config.yaml" {
+			return pid, filepath.Dir(configPath)
+		}
+		return pid, configPath
+	}
+	if cwd := getProcessCWD(pid); cwd != "" {
+		return pid, cwd
+	}
 	return pid, ""
 }
 
@@ -1347,8 +1446,8 @@ data_dir: "%s"
 behavior:
   dolt_transaction_commit: false
   auto_gc_behavior:
-    enable: true
-    archive_level: 1
+    enable: false
+    archive_level: 0
 `,
 		config.LogLevel,
 		config.Port,
@@ -1677,6 +1776,7 @@ func Start(townRoot string) error {
 		// runs gt dolt stop + gt dolt start. (gt-nq1)
 		if len(databases) == 0 {
 			applyWaitTimeout(townRoot, config) // Best-effort; see gh-3623.
+			applyTimeZone(townRoot, config)    // Best-effort; see hq-57jr8.
 			return nil                         // Nothing to verify — fresh install or empty data dir
 		}
 		_, missing, verifyErr := VerifyDatabases(townRoot)
@@ -1686,6 +1786,7 @@ func Start(townRoot string) error {
 		}
 		if len(missing) == 0 {
 			applyWaitTimeout(townRoot, config) // Best-effort; see gh-3623.
+			applyTimeZone(townRoot, config)    // Best-effort; see hq-57jr8.
 			return nil                         // Server is up and serving every expected database
 		}
 		lastErr = fmt.Errorf("server is reachable but %d/%d databases not yet served (missing: %v)",
@@ -3882,6 +3983,35 @@ func buildWaitTimeoutQuery(seconds int) string {
 	return fmt.Sprintf("SET GLOBAL wait_timeout = %d", seconds)
 }
 
+// applyTimeZoneFn is the SQL-exec seam used by applyTimeZone. Tests override
+// it to verify policy + query-formatting without spawning a real dolt subprocess.
+var applyTimeZoneFn = serverExecSQL
+
+// applyTimeZone sets MySQL's `time_zone` server variable on the running Dolt
+// server so server-side `NOW()` and `CURRENT_TIMESTAMP` agree with Go-side
+// `time.Now().UTC()` writes. Without this override Dolt inherits the host TZ,
+// which makes ad-hoc `dolt sql` queries against `created_at`/`closed_at`
+// produce nonsense diffs (e.g. wisps appear hours in the future). The reaper
+// itself binds Go-side UTC values and is unaffected, but humans triaging
+// wisp lifecycle issues are routinely misled — see hq-57jr8.
+//
+// Best-effort: a failure here is logged but does not fail the start.
+func applyTimeZone(townRoot string, config *Config) {
+	if config.TimeZone == "" {
+		return
+	}
+	query := buildTimeZoneQuery(config.TimeZone)
+	if err := applyTimeZoneFn(townRoot, query); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not set Dolt time_zone=%q: %v\n", config.TimeZone, err)
+	}
+}
+
+// buildTimeZoneQuery returns the SET GLOBAL statement applyTimeZone dispatches.
+// Extracted for direct testability.
+func buildTimeZoneQuery(tz string) string {
+	return fmt.Sprintf("SET GLOBAL time_zone = '%s'", tz)
+}
+
 // disk but does NOT register them with the live server catalog. This caused
 // "database not found" errors during gt rig add.
 func serverExecSQL(townRoot, query string) error {
@@ -3906,7 +4036,8 @@ func serverExecSQL(townRoot, query string) error {
 //
 // Dolt requires --host, --port, --user, --no-tls as global flags (before the
 // subcommand), not as subcommand flags. The order is:
-//   dolt --host=H --port=P --user=U --no-tls sql -q "..."
+//
+//	dolt --host=H --port=P --user=U --no-tls sql -q "..."
 func buildServerSQLCmd(ctx context.Context, config *Config, args ...string) *exec.Cmd {
 	// Global connection flags must come before the "sql" subcommand.
 	// Always pass --password to prevent dolt from prompting on stdin

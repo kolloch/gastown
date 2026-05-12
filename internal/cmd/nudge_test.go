@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -304,6 +305,10 @@ func TestNudgeValidModesAccepted(t *testing.T) {
 		waitIdleTimeout = origTimeout
 	}()
 
+	// Route nudge transport to a log file so the test doesn't deliver "test"
+	// messages to live agents (mayor reported recurring synthetic nudges).
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+
 	// Shorten wait-idle timeout to avoid 15s test delay
 	waitIdleTimeout = 200 * time.Millisecond
 
@@ -461,6 +466,10 @@ func TestNudgeTrailingSlashNormalization(t *testing.T) {
 		nudgeStdinFlag = origStdin
 		waitIdleTimeout = origTimeout
 	}()
+
+	// Route nudge transport to a log file so this test doesn't deliver to
+	// the real mayor/deacon/witness/refinery sessions on host.
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
 
 	waitIdleTimeout = 200 * time.Millisecond
 	nudgeStdinFlag = false

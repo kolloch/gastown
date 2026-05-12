@@ -18,6 +18,7 @@ import (
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // Polecat command flags
@@ -1814,8 +1815,13 @@ func runPolecatPoolInit(cmd *cobra.Command, args []string) error {
 			fmt.Printf(" %s %v\n", style.Warning.Render("FAILED"), addErr)
 			continue
 		}
-		// Set agent state to idle (polecat was created without work)
-		if stateErr := mgr.SetAgentState(name, "idle"); stateErr != nil {
+		// Set agent state to idle (polecat was created without work).
+		// Use the retry variant: createAgentBeadWithRetry above leaves a brief
+		// Dolt MVCC visibility window where the just-committed bead isn't yet
+		// readable by the next UpdateAgentState query, surfacing as "issue not
+		// found". Retries with backoff close that window — same pattern as
+		// SetAgentStateWithRetry's other call site in polecat_spawn.go.
+		if stateErr := mgr.SetAgentStateWithRetry(name, "idle"); stateErr != nil {
 			fmt.Printf(" %s (created but couldn't set idle state: %v)\n", style.Warning.Render("⚠"), stateErr)
 		} else {
 			fmt.Printf(" %s (%s)\n", style.Success.Render("✓"), style.Dim.Render(p.ClonePath))
@@ -1825,6 +1831,16 @@ func runPolecatPoolInit(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("\n%s Pool initialized: %d created, %d total (target: %d)\n",
 		style.Bold.Render("✓"), created, created+len(existing), poolSize)
+
+	// Sync hooks so all polecat settings.json files reflect current defaults.
+	// Pool-init may run long after rig-add, when gt defaults have changed.
+	townRoot, twErr := workspace.FindFromCwdOrError()
+	if twErr == nil {
+		ensureHooksBase()
+		if err := syncRigHooks(townRoot, rigName); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to sync hooks after pool-init: %v\n", err)
+		}
+	}
 
 	return nil
 }

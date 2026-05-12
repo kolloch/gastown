@@ -558,8 +558,7 @@ func runMQPostMerge(_ *cobra.Command, args []string) error {
 	// Get git client for the rig
 	rigGit, err := getRigGit(r.Path)
 	if err != nil {
-		fmt.Printf("  %s branch delete: %v\n", style.Warning.Render("⚠"), err)
-		return nil // non-fatal: beads cleanup succeeded
+		return fmt.Errorf("remote branch delete: %w", err)
 	}
 
 	// Delete remote branch — but skip if there's an open PR on it.
@@ -568,7 +567,7 @@ func runMQPostMerge(_ *cobra.Command, args []string) error {
 	if rigGit.HasOpenPR(mr.Branch) {
 		fmt.Printf("  %s Skipping remote branch delete for %s: open PR exists (gas-fk4)\n", style.Dim.Render("○"), mr.Branch)
 	} else if err := rigGit.DeleteRemoteBranch("origin", mr.Branch); err != nil {
-		fmt.Printf("  %s remote branch delete: %v\n", style.Warning.Render("⚠"), err)
+		return fmt.Errorf("remote branch delete %s: %w", mr.Branch, err)
 	} else {
 		fmt.Printf("  %s Deleted remote branch: %s\n", style.Success.Render("✓"), mr.Branch)
 	}

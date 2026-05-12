@@ -109,8 +109,9 @@ const (
 	DefaultWitnessStartupStallThreshold  = 90 * time.Second
 	DefaultWitnessStartupActivityGrace   = 60 * time.Second
 	DefaultWitnessMaxBeadRespawns        = 3
-	DefaultWitnessDoneIntentStuckTimeout = 60 * time.Second
-	DefaultWitnessDoneIntentRecentGrace  = 30 * time.Second
+	DefaultWitnessDoneIntentStuckTimeout    = 60 * time.Second
+	DefaultWitnessDoneIntentRecentGrace     = 30 * time.Second
+	DefaultWitnessHeartbeatStartupGrace     = 5 * time.Minute
 )
 
 // LoadOperationalConfig loads operational config from a town root.
@@ -731,4 +732,14 @@ func (wt *WitnessThresholds) DoneIntentRecentGraceD() time.Duration {
 		return ParseDurationOrDefault(wt.DoneIntentRecentGrace, DefaultWitnessDoneIntentRecentGrace)
 	}
 	return DefaultWitnessDoneIntentRecentGrace
+}
+
+// HeartbeatStartupGraceD returns the configured or default heartbeat startup grace period.
+// A live polecat with assigned work but no heartbeat file older than this is flagged
+// for review as possibly stuck at startup (e.g., auth 401). (gt-uk7)
+func (wt *WitnessThresholds) HeartbeatStartupGraceD() time.Duration {
+	if wt != nil {
+		return ParseDurationOrDefault(wt.HeartbeatStartupGrace, DefaultWitnessHeartbeatStartupGrace)
+	}
+	return DefaultWitnessHeartbeatStartupGrace
 }

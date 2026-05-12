@@ -207,7 +207,7 @@ default = "168h"
 
 [vars.alert_threshold]
 description = "Open wisp count that triggers escalation warning"
-default = "500"
+default = "800"
 
 [vars.dry_run]
 description = "If 'true', report without modifying data"

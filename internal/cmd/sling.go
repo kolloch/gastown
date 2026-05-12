@@ -1077,7 +1077,13 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 // checkCrossRigGuard validates that a bead's prefix matches the target rig.
 // Polecats work in their rig's worktree and cannot fix code owned by another rig.
 // Returns an error if the bead belongs to a different rig than the target polecat.
-// Town-root beads (hq-*) are rejected — tasks must be created in the target rig.
+//
+// When the prefix maps to town root, the guard warns rather than errors: this
+// ambiguous case arises when a crew member's redirect chain is broken and their
+// rig's .beads dir shares the town-level database and prefix (gt-gbu). Blocking
+// here would silently swallow all polecat work for the affected rig.
+//
+// Truly unknown prefixes (not in routes.jsonl at all) are still hard-rejected.
 func checkCrossRigGuard(beadID, targetAgent, townRoot string) error {
 	beadPrefix := beads.ExtractPrefix(beadID)
 	if beadPrefix == "" {
@@ -1094,9 +1100,25 @@ func checkCrossRigGuard(beadID, targetAgent, townRoot string) error {
 
 	if beadRig != targetRig {
 		if beadRig == "" {
-			return fmt.Errorf("bead %s (prefix %q) is not in rig %q — it belongs to town root\n"+
-				"Create the task from the rig directory: cd %s && bd create --title=...\n"+
-				"Use --force to override", beadID, strings.TrimSuffix(beadPrefix, "-"), targetRig, targetRig)
+			// GetRigNameForPrefix returns "" for two distinct cases:
+			//   (a) prefix is in routes.jsonl with path="." (known town-root prefix)
+			//   (b) prefix is not in routes.jsonl at all (unknown prefix)
+			// GetRigPathForPrefix distinguishes them: it returns townRoot for (a),
+			// empty string for (b).
+			if beads.GetRigPathForPrefix(townRoot, beadPrefix) == "" {
+				// Unknown prefix — no route exists, can't resolve rig.
+				return fmt.Errorf("bead %s (prefix %q) is not in rig %q — prefix not in routes\n"+
+					"Create the task from the rig directory: cd %s && bd create --title=...\n"+
+					"Use --force to override", beadID, strings.TrimSuffix(beadPrefix, "-"), targetRig, targetRig)
+			}
+			// Known town-root prefix — warn but allow. A crew member may have a
+			// broken redirect chain causing rig beads to land in the town DB with
+			// the town prefix. Blocking here silently drops all their polecat work
+			// (gt-gbu). The polecat will surface any true mismatch on execution.
+			fmt.Printf("  %s Bead %s has prefix %q (town root) but target is rig %q — "+
+				"proceeding (broken redirect chain? see gt-gbu)\n",
+				style.Warning.Render("⚠"), beadID, strings.TrimSuffix(beadPrefix, "-"), targetRig)
+			return nil
 		}
 		return fmt.Errorf("cross-rig mismatch: bead %s (prefix %q) belongs to rig %q, but target is rig %q\n"+
 			"Create the task from the target rig: cd %s && bd create --title=...\n"+

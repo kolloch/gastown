@@ -485,6 +485,12 @@ type WitnessThresholds struct {
 	// DoneIntentRecentGrace is how recently a done-intent must have been created
 	// to be considered still in progress (default "30s").
 	DoneIntentRecentGrace string `json:"done_intent_recent_grace,omitempty"`
+
+	// HeartbeatStartupGrace is how long after session creation the witness waits
+	// before flagging a live polecat with assigned work but no heartbeat file as
+	// possibly stuck at startup (e.g., auth 401 blocking initialization, default "5m").
+	// The witness exposes the signal; patrol formula decides whether to escalate.
+	HeartbeatStartupGrace string `json:"heartbeat_startup_grace,omitempty"`
 }
 
 // DefaultOperationalConfig returns an OperationalConfig with all defaults.

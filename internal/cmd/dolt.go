@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -122,13 +121,11 @@ var doltLogsCmd = &cobra.Command{
 
 var doltDumpCmd = &cobra.Command{
 	Use:   "dump",
-	Short: "Dump Dolt server goroutine stacks for debugging",
-	Long: `Send SIGQUIT to the Dolt server to dump goroutine stacks to its log file.
+	Short: "Collect non-fatal Dolt server diagnostics",
+	Long: `Collect a non-fatal Dolt diagnostic snapshot for incident response.
 
-Per Tim Sehn (Dolt CEO): kill -QUIT prints all goroutine stacks to stderr,
-which is redirected to the server log. Useful for diagnosing hung servers.
-
-The dump is written to the server log file. Use 'gt dolt logs' to view it.`,
+This command does not send SIGQUIT. Dolt 1.86.5 terminates sql-server after
+SIGQUIT, so default diagnostics gather process metadata and recent logs only.`,
 	RunE: runDoltDump,
 }
 
@@ -747,22 +744,48 @@ func runDoltDump(cmd *cobra.Command, args []string) error {
 
 	config := doltserver.DefaultConfig(townRoot)
 
-	// Send SIGQUIT to get goroutine stack dump (written to server's stderr = log file)
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("finding process %d: %w", pid, err)
+	fmt.Printf("Dolt diagnostic snapshot (non-fatal)\n")
+	fmt.Printf("  Live PID:   %d\n", pid)
+	fmt.Printf("  Port:       %d\n", config.Port)
+	fmt.Printf("  Data dir:   %s\n", config.DataDir)
+	fmt.Printf("  Log file:   %s\n", config.LogFile)
+	fmt.Printf("  Connection: %s\n", doltserver.GetConnectionString(townRoot))
+
+	if info, err := doltserver.ReadSQLServerInfo(townRoot); err == nil {
+		fmt.Printf("  SQL metadata: %s\n", info.Path)
+		fmt.Printf("    PID:       %d\n", info.PID)
+		fmt.Printf("    Port:      %d\n", info.Port)
+		if info.ServerID != "" {
+			fmt.Printf("    Server ID: %s\n", info.ServerID)
+		}
+	} else {
+		fmt.Printf("  SQL metadata: unavailable (%v)\n", err)
 	}
 
-	fmt.Printf("Sending SIGQUIT to Dolt server (PID %d)...\n", pid)
-	if err := proc.Signal(syscall.SIGQUIT); err != nil {
-		return fmt.Errorf("sending SIGQUIT: %w", err)
+	if state, err := doltserver.LoadState(townRoot); err == nil && state.PID > 0 {
+		fmt.Printf("  Daemon state: %s\n", doltserver.StateFile(townRoot))
+		fmt.Printf("    PID:       %d", state.PID)
+		if state.PID != pid {
+			fmt.Printf(" (stale; live PID is %d)", pid)
+		}
+		fmt.Println()
+		if !state.StartedAt.IsZero() {
+			fmt.Printf("    Started:   %s\n", state.StartedAt.Format("2006-01-02 15:04:05"))
+		}
+		if state.DataDir != "" {
+			fmt.Printf("    Data dir:  %s\n", state.DataDir)
+		}
 	}
 
-	// Give the server a moment to write the dump
-	time.Sleep(500 * time.Millisecond)
+	fmt.Printf("\nRecent Dolt log lines:\n")
+	tailCmd := exec.Command("tail", "-n", "200", config.LogFile)
+	tailCmd.Stdout = os.Stdout
+	tailCmd.Stderr = os.Stderr
+	if err := tailCmd.Run(); err != nil {
+		fmt.Printf("  (unable to read recent logs: %v)\n", err)
+	}
 
-	fmt.Printf("Goroutine stack dump written to: %s\n", config.LogFile)
-	fmt.Printf("View with: gt dolt logs -n 200\n")
+	fmt.Printf("\nNo signal was sent. Do not use kill -QUIT for routine diagnostics unless the Dolt version has been verified not to terminate on SIGQUIT.\n")
 
 	return nil
 }

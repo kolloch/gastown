@@ -12,7 +12,7 @@ var townRootCLAUDEmdRaw string
 
 // TownRootCLAUDEmdVersion is the version of the embedded town-root CLAUDE.md.
 // Increment this when updating the template content with new sections.
-const TownRootCLAUDEmdVersion = 1
+const TownRootCLAUDEmdVersion = 2
 
 // TownRootCLAUDEmd returns the canonical town-root CLAUDE.md content
 // with the CLI command name substituted.

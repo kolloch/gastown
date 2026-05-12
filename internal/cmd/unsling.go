@@ -30,8 +30,16 @@ Examples:
   gt unsling gt-abc                 # Only unsling if gt-abc is hooked
   gt unsling greenplace/joe            # Clear joe's hook
   gt unsling gt-abc greenplace/joe     # Unsling gt-abc from joe
+  gt unsling --by-bead gt-abc       # Zombie-polecat escape hatch: clear bead
+                                    # without resolving the assignee's tmux session
 
 The bead's status changes from 'hooked' back to 'open'.
+
+The --by-bead flag bypasses tmux session resolution entirely. This is the
+escape hatch for "zombie polecats" — beads still flagged as hooked whose
+assignee no longer has a live tmux session. Standard unsling fails in that
+state with "getting pane for <session>: exit status 1"; --by-bead clears
+the bead's status and assignee directly without touching tmux.
 
 Related commands:
   gt sling <bead>    # Hook + start (inverse of unsling)
@@ -42,17 +50,22 @@ Related commands:
 }
 
 var (
-	unslingDryRun bool
-	unslingForce  bool
+	unslingDryRun  bool
+	unslingForce   bool
+	unslingByBead  string
 )
 
 func init() {
 	unslingCmd.Flags().BoolVarP(&unslingDryRun, "dry-run", "n", false, "Show what would be done")
 	unslingCmd.Flags().BoolVarP(&unslingForce, "force", "f", false, "Unsling even if work is incomplete")
+	unslingCmd.Flags().StringVar(&unslingByBead, "by-bead", "", "Clear bead by ID, skipping tmux session resolution (zombie-polecat escape hatch)")
 	rootCmd.AddCommand(unslingCmd)
 }
 
 func runUnsling(cmd *cobra.Command, args []string) error {
+	if unslingByBead != "" {
+		return runUnslingByBead(cmd, unslingByBead, unslingDryRun)
+	}
 	return runUnslingWith(cmd, args, unslingDryRun, unslingForce)
 }
 
@@ -255,6 +268,65 @@ func runUnslingWith(cmd *cobra.Command, args []string, dryRun, force bool) error
 	fmt.Printf("%s Work removed from hook\n", style.Bold.Render("✓"))
 	fmt.Printf("  Agent %s hook cleared (was: %s)\n", agentID, hookedBeadID)
 
+	return nil
+}
+
+// runUnslingByBead implements the `gt unsling --by-bead <id>` zombie-polecat
+// escape hatch. It skips tmux session resolution entirely and just clears the
+// bead's status (-> open) and assignee directly. Use this when the assignee
+// polecat's tmux session is gone and the standard target-resolution path fails
+// with "getting pane for <session>: exit status 1".
+func runUnslingByBead(cmd *cobra.Command, beadID string, dryRun bool) error {
+	if beadID == "" {
+		return fmt.Errorf("--by-bead requires a bead ID")
+	}
+
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil {
+		return fmt.Errorf("finding town root: %w", err)
+	}
+
+	// Resolve the correct beads directory for this bead via its prefix. The
+	// target agent's session is irrelevant here — the bead carries enough
+	// routing info on its own.
+	beadsPath := beads.ResolveHookDir(townRoot, beadID, townRoot)
+	b := beads.New(beadsPath)
+
+	bead, err := b.Show(beadID)
+	if err != nil {
+		return fmt.Errorf("getting bead %s from %s: %w", beadID, beadsPath, err)
+	}
+
+	prevAssignee := bead.Assignee
+	prevStatus := bead.Status
+
+	if dryRun {
+		fmt.Printf("Would clear bead %s (previous assignee=%q, status=%q) -> status=open, assignee=\"\"\n",
+			beadID, prevAssignee, prevStatus)
+		return nil
+	}
+
+	openStatus := "open"
+	emptyAssignee := ""
+	if err := b.Update(beadID, beads.UpdateOptions{
+		Status:   &openStatus,
+		Assignee: &emptyAssignee,
+	}); err != nil {
+		return fmt.Errorf("updating bead %s: %w", beadID, err)
+	}
+
+	// Audit logging: route through the same unhook feed as standard unsling
+	// so observers see the event. Use prevAssignee as the agent ID (may be
+	// empty if the bead had already been cleared).
+	_ = events.LogFeed(events.TypeUnhook, prevAssignee, events.UnhookPayload(beadID))
+
+	fmt.Printf("%s by-bead bypass: cleared assignee on %s; tmux session resolution skipped\n",
+		style.Bold.Render("✓"), beadID)
+	if prevAssignee != "" {
+		fmt.Printf("  Previous assignee: %s (status was: %s)\n", prevAssignee, prevStatus)
+	} else {
+		fmt.Printf("  No previous assignee (status was: %s)\n", prevStatus)
+	}
 	return nil
 }
 
