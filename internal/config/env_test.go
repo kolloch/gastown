@@ -841,6 +841,68 @@ func TestAgentEnv_IncludesClaudeCodeClearing(t *testing.T) {
 	}
 }
 
+func TestAgentEnv_PropagatesPath(t *testing.T) {
+	// Not parallel: this test mutates the process PATH env var.
+	// Verify AgentEnv propagates the daemon's PATH into spawned sessions.
+	// Without this, tmux -e flags overlay onto a session env that lacks PATH,
+	// and `exec env <vars> claude ...` fails with status 127 because env
+	// cannot find the claude binary (hq-6y9y8).
+	origPath := os.Getenv("PATH")
+	defer os.Setenv("PATH", origPath)
+
+	const testPath = "/test/bin:/usr/bin:/home/user/.local/bin"
+	if err := os.Setenv("PATH", testPath); err != nil {
+		t.Fatalf("setenv PATH: %v", err)
+	}
+
+	roles := []struct {
+		role      string
+		rig       string
+		agentName string
+	}{
+		{"mayor", "", ""},
+		{"deacon", "", ""},
+		{"boot", "", ""},
+		{"witness", "myrig", ""},
+		{"refinery", "myrig", ""},
+		{"polecat", "myrig", "Toast"},
+		{"crew", "myrig", "emma"},
+		{"dog", "", "alpha"},
+	}
+	for _, r := range roles {
+		t.Run(r.role, func(t *testing.T) {
+			env := AgentEnv(AgentEnvConfig{
+				Role:      r.role,
+				Rig:       r.rig,
+				AgentName: r.agentName,
+				TownRoot:  "/town",
+			})
+			assertEnv(t, env, "PATH", testPath)
+		})
+	}
+}
+
+func TestAgentEnv_PathOmittedWhenUnset(t *testing.T) {
+	// Not parallel: this test mutates the process PATH env var.
+	// When the daemon's own PATH is empty (defensive: should never happen in
+	// practice), AgentEnv should omit PATH rather than set it to "" — which
+	// would clobber any inherited PATH in the tmux session.
+	origPath := os.Getenv("PATH")
+	defer os.Setenv("PATH", origPath)
+
+	if err := os.Unsetenv("PATH"); err != nil {
+		t.Fatalf("unsetenv PATH: %v", err)
+	}
+
+	env := AgentEnv(AgentEnvConfig{
+		Role:     "mayor",
+		TownRoot: "/town",
+	})
+	if v, ok := env["PATH"]; ok {
+		t.Errorf("PATH should be omitted when process PATH is empty, got %q", v)
+	}
+}
+
 func TestAgentEnv_DisablesBdBackup(t *testing.T) {
 	t.Parallel()
 	// Verify AgentEnv always includes BD_BACKUP_ENABLED=false regardless of role.

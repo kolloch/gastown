@@ -3043,7 +3043,17 @@ func (d *Daemon) pruneStaleBranches() {
 func (d *Daemon) dispatchQueuedWork() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "gt", "scheduler", "run")
+	// Use the resolved gtPath instead of relying on Go's exec.LookPath at call
+	// time. exec.Command("gt", ...) resolves "gt" via the parent's PATH the
+	// moment Command is created; if the daemon's PATH lookup ever races with
+	// PATH augmentation (PATCH-007) or PATH is otherwise minimal, this fails
+	// with `exec: "gt": executable file not found in $PATH` (hq-6y9y8). The
+	// daemon already resolved gtPath at startup — use it.
+	gtPath := d.gtPath
+	if gtPath == "" {
+		gtPath = "gt"
+	}
+	cmd := exec.CommandContext(ctx, gtPath, "scheduler", "run")
 	setSysProcAttr(cmd)
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = append(os.Environ(), "GT_DAEMON=1", "BD_DOLT_AUTO_COMMIT=off")
